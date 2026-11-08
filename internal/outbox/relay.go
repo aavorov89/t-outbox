@@ -45,9 +45,12 @@ type Hooks struct {
 	// AfterClaim runs after rows are locked, before publishing. F4 uses it to record
 	// in-flight IDs per worker.
 	AfterClaim func(ctx context.Context, ids []int64)
-	// AfterPublish runs after Kafka acked, before the rows are marked published. It gets the
-	// claiming tx so F5 can read pg_backend_pid() and kill that backend. ids are the acked
-	// rows. A non-nil error aborts the cycle and rolls back the tx. (M5)
+	// AfterPublish runs after Kafka acked, before the rows are marked published: the window
+	// of F5. ids are the acked rows. It gets the claiming tx, so a test can kill the
+	// backend that holds the row locks: SELECT pg_backend_pid() on tx gives its PID (the
+	// server's answer, right even behind a pooler), and pg_terminate_backend on a side
+	// connection ends the session the way a kill -9 of the relay would. A non-nil
+	// error aborts the cycle and rolls back the tx.
 	AfterPublish func(ctx context.Context, tx pgx.Tx, ids []int64) error
 }
 

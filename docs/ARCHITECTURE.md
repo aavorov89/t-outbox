@@ -80,7 +80,9 @@ binary so you can scale it on its own and kill it in tests.
 ├── test/e2e/             # cross-component suites (F5, F10)
 ├── deploy/
 │   ├── .env              # image versions: single source for compose AND testcontainers
-│   └── docker-compose.yml  # postgres, redpanda (+ topic init), later jaeger and the 3 binaries
+│   ├── Dockerfile        # one image with all binaries
+│   └── docker-compose.yml  # postgres, redpanda (+ topic init); profile `app`: api, 2 relays, consumer
+├── scripts/              # demo.sh, chaos.sh (make demo, make chaos)
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── api-errors.md     # problem types, idempotency semantics
@@ -659,8 +661,8 @@ The relay has test-only seams:
 
 ```go
 type Hooks struct {
-    AfterClaim   func(ctx context.Context, ids []int64)                  // F4: record in-flight IDs
-    AfterPublish func(ctx context.Context, tx pgx.Tx, ids []int64) error // F5: tx gives pg_backend_pid()
+    AfterClaim   func(ctx context.Context, ids []int64)                  // F4: in-flight IDs; F5: who re-claimed
+    AfterPublish func(ctx context.Context, tx pgx.Tx, ids []int64) error // F5: SELECT pg_backend_pid() on tx
 }
 ```
 
@@ -673,12 +675,14 @@ sequenceDiagram
     participant R2 as Relay #2
     participant L as Ledger consumer
 
-    T->>PG: create + capture payment (outbox rows)
+    T->>PG: create + capture 3 payments (6 outbox rows)
     R1->>PG: BEGIN; claim ... FOR UPDATE SKIP LOCKED
-    R1->>K: ProduceSync(event E)  ✅ acked
-    Note over R1: AfterPublish hook: pg_terminate_backend(own pid)<br/>simulates process death
-    PG-->>PG: tx aborted, row lock released, published_at still NULL
-    R2->>PG: claim → gets E again
+    R2->>PG: claim: E is locked, SKIP LOCKED hides it
+    R1->>K: ProduceSync(batch with event E)  ✅ acked
+    Note over R1: AfterPublish hook: pg_terminate_backend(own pid, 5000)<br/>on a side conn, cancel R1's ctx: process death
+    PG-->>PG: tx aborted, row locks released, published_at still NULL
+    Note over R1: the mark fails with 57P01; R1's Run returns
+    R2->>PG: claim → gets E again (AfterClaim signals the test)
     R2->>K: ProduceSync(event E)  (duplicate)
     R2->>PG: UPDATE published_at; COMMIT
     L->>K: consume E (1st) → apply, insert processed_events
@@ -687,9 +691,29 @@ sequenceDiagram
     T->>PG: assert exactly 1 ledger transaction, 1 processed_events row
 ```
 
-Killing the backend from the hook (`SELECT pg_terminate_backend(pg_backend_pid())` on a
-separate conn, using the PID captured at claim time) is closer to a real crash than
-returning an error. The worker's tx dies on the server side, as it would after a `kill -9`.
+Killing the backend from the hook is closer to a real crash than returning an error: the
+worker's tx dies on the server side, as it would after a `kill -9` of the process.
+
+- **The PID.** The hook gets the claiming tx and asks it: `SELECT pg_backend_pid()`.
+  That is the server's own answer, so it stays right behind a pooler (a tx pins its server
+  connection); `tx.Conn().PgConn().PID()` would save the round trip but is only the
+  `BackendKeyData` of the client connection, which PgBouncer fakes. A side connection
+  (`testenv.Connect`) runs `pg_terminate_backend(pid, 5000)`; the timeout makes it wait
+  until the backend has exited, so the locks are released when it returns. The hook then
+  cancels the relay's ctx (no further cycles) and returns nil, so the relay goes on to its
+  mark, which fails on the dead session: proof the rows were not marked.
+- **Two relays from the start, one victim.** Both run `Run`; whichever publishes the
+  target event (payment #0's `payment.captured`) first dies. The other cannot claim it
+  while it is locked.
+- **Waiting for the survivor** is event-driven, not a sleep: its `AfterClaim` sees the
+  target's row id after the crash and signals a channel. Then the test waits for
+  "no unpublished rows", reads the topic and waits for the group's committed offsets to
+  reach its end.
+- **Assertions.** Kafka holds exactly two copies of every event of the killed batch (all
+  its records were acked) and one of every other event; the target row has
+  `attempts = 0` (the crashed cycle left no trace); the consumer applied each event once
+  and reported every further copy as a duplicate; `processed_events` = 6 rows, the ledger
+  3 transactions (one for the target), `CheckBalanced` passes. Stable under `-count=15`.
 
 ### Other test notes
 - **F4:** 8 workers, 1,000 events (200 aggregates × 5), `FakeProducer`. Assert that no
@@ -734,11 +758,27 @@ returning an error. The worker's tx dies on the server side, as it would after a
 ## 12. Local run and CI
 
 ```
-make up        # docker compose: postgres, redpanda + topics, migrations (later: jaeger, api, 2x relay, consumer)
+make up        # docker compose: postgres, redpanda + topics, migrations (later: jaeger)
+make app       # profile `app`: api (:8080), relay-1, relay-2, ledger-consumer from deploy/Dockerfile
 make lint      # golangci-lint in Docker, as your uid
-make demo      # curl script: create + capture 100 payments, print ledger balance
-make chaos     # kills a relay container in a loop while demo runs; ledger stays balanced
+make demo      # curl script: create + capture 100 payments, wait for the consumer, print the ledger
+make chaos     # SIGKILLs relay containers in a loop under load; fails unless the ledger is exact
 ```
+
+`make chaos` (`scripts/chaos.sh`) starts the `app` profile, waits until earlier events are
+drained, then creates and captures 2,000 payments with 8 clients while it `docker kill -s
+KILL`s a random relay every 0.1–1s and starts it again 0.1–0.5s later. Afterwards it waits
+until every outbox row is published and processed, and checks:
+
+- every ledger transaction sums to zero per currency;
+- every captured payment has exactly one ledger transaction (none lost, none doubled);
+- `psp:receivable` equals the captured total per currency.
+
+It also reports the duplicates: Kafka records (sum of high watermarks) minus outbox rows
+of the run. A kill only duplicates when it lands between Kafka's ack and the COMMIT; a
+run on a dev laptop got 10 kills and 57 re-published events, all skipped by the consumer. Knobs:
+`CHAOS_PAYMENTS`, `CHAOS_CONCURRENCY`, `CHAOS_TARGETS` (add `ledger-consumer` to kill the
+consumer too, i.e. F7 in the wild).
 
 GitHub Actions: `golangci-lint` → unit tests (`-race`) → integration tests
 (testcontainers runs on `ubuntu-latest` without extra setup) → coverage badge.
@@ -769,7 +809,7 @@ GitHub Actions: `golangci-lint` → unit tests (`-race`) → integration tests
 | **M2 — Walking skeleton** | `POST /payments` → `pgx.Batch` repo → naive relay (no `SKIP LOCKED`, no retries, single instance) → Kafka → consumer that only logs; UUIDv7 ids, RFC 9457 errors, API idempotency (same key + different body → 422) | F1–F3 and the end-to-end test pass ✅ |
 | **M3 — Hardening the write path and the relay** | capture endpoint with `Idempotency-Key` (`Repo.Update` under `FOR UPDATE`); claim/publish/mark in one tx with `SKIP LOCKED` + `NOT EXISTS` ordering guard, per-record backoff, timeout chain checked at start-up, graceful shutdown with drain timeout. Metrics move to M6 (OTel meters) | F1–F4, F6, F9 pass; `TestEndToEnd_PaymentEventsReachConsumer` covers create + capture ✅ |
 | **M4 — Consumer** | ledger double-entry with the balance invariant, `processed_events`; `Processor` (dedup, retries, classification) and `Runner` (auto-commit off, commit after the DB commit, `BlockRebalanceOnPoll` + interrupt on a waiting rebalance, no commit past a failed DLQ send); `kafkax.DLQ`; e2e ends in a ledger transaction | F7, F8 tests pass ✅ |
-| **M5 — Crash scenario** | `Hooks.AfterPublish`, F5 test, `make chaos` | F5 test passes, chaos run leaves ledger balanced |
+| **M5 — Crash scenario** | `Hooks.AfterPublish`, F5 test (two relays, backend killed after the ack), app image + compose profile, `make demo`, `make chaos` | F5 test passes, chaos run leaves ledger balanced ✅ |
 | **M6 — Tracing and metrics** | OTel across all three services, Jaeger in compose; relay metrics from §7 | F10 test passes, screenshot in README |
 | **M7 — Polish** | README (diagram, guarantees, failure matrix), ADRs, simple load numbers | A reviewer gets the point in 2 minutes |
 

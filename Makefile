@@ -6,7 +6,7 @@ GOMODCACHE   := $(shell $(GO) env GOMODCACHE)
 LINT_CACHE   ?= $(HOME)/.cache/golangci-lint-docker
 UIDGID       := $(shell id -u):$(shell id -g)
 
-.PHONY: up down migrate run-api run-relay run-consumer test test-integration lint fmt tidy
+.PHONY: up down app migrate run-api run-relay run-consumer demo chaos test test-integration lint fmt tidy
 
 ## Local stack: postgres + redpanda (+ topics), then migrations.
 up:
@@ -15,7 +15,12 @@ up:
 	DATABASE_URL='$(DATABASE_URL)' $(GO) run ./cmd/migrate
 
 down:
-	$(COMPOSE) down -v
+	$(COMPOSE) --profile app down -v
+
+## The binaries as containers (deploy/Dockerfile): api on :8080, relay-1, relay-2,
+## ledger-consumer. Needs `make up`.
+app:
+	$(COMPOSE) --profile app up -d --build api relay-1 relay-2 ledger-consumer
 
 migrate:
 	DATABASE_URL='$(DATABASE_URL)' $(GO) run ./cmd/migrate
@@ -30,6 +35,16 @@ run-relay:
 
 run-consumer:
 	DATABASE_URL='$(DATABASE_URL)' KAFKA_BROKERS='$(KAFKA_BROKERS)' $(GO) run ./cmd/ledger-consumer
+
+## Create and capture 100 payments via the API (make app, or the run-* targets), wait for
+## the consumer, print the ledger balance. DEMO_PAYMENTS, DEMO_CONCURRENCY, API_URL.
+demo:
+	COMPOSE='$(COMPOSE)' scripts/demo.sh
+
+## SIGKILL relay containers in a loop under load; fails unless the ledger is exact.
+## Starts the app profile itself. CHAOS_PAYMENTS, CHAOS_CONCURRENCY, CHAOS_TARGETS.
+chaos:
+	COMPOSE='$(COMPOSE)' scripts/chaos.sh
 
 ## Unit tests only: no Docker needed.
 test:

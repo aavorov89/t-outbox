@@ -1,6 +1,31 @@
 # Local dev stack. Image versions live in deploy/.env (shared with testcontainers).
 # Integration tests do NOT use this file; they start their own containers.
+#
+# Default services: postgres, redpanda, topics (`make up`). The `app` profile adds the
+# binaries, built from deploy/Dockerfile: api, two relays and the ledger consumer
+# (`make app`, used by `make chaos`).
 name: t-outbox
+
+x-app: &app
+  image: t-outbox-app:dev
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+    args:
+      GO_IMAGE: ${GO_IMAGE}
+      RUNTIME_IMAGE: ${RUNTIME_IMAGE}
+  profiles: [app]
+  # No restart policy: `make chaos` kills relays with SIGKILL and starts them itself.
+  restart: "no"
+  environment: &app-env
+    DATABASE_URL: postgres://outbox:outbox@postgres:5432/outbox?sslmode=disable
+    KAFKA_BROKERS: redpanda:9092
+
+x-after-setup: &after-setup
+  migrate:
+    condition: service_completed_successfully
+  topics:
+    condition: service_completed_successfully
 
 services:
   postgres:
@@ -50,7 +75,36 @@ services:
         rpk -X brokers=redpanda:9092 topic create payments.events.dlq -p 1 -r 1 --if-not-exists
     restart: "no"
 
-  # API, relays, consumer and Jaeger are added in M2–M6.
+  migrate:
+    <<: *app
+    command: ["migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["payments-api"]
+    environment:
+      <<: *app-env
+      HTTP_ADDR: ":8080"
+    ports:
+      - "${API_PORT:-8080}:8080"
+    depends_on: *after-setup
+
+  relay-1: &relay
+    <<: *app
+    command: ["outbox-relay"]
+    depends_on: *after-setup
+
+  relay-2: *relay
+
+  ledger-consumer:
+    <<: *app
+    command: ["ledger-consumer"]
+    depends_on: *after-setup
+
+  # Jaeger is added in M6.
 
 volumes:
   pgdata:

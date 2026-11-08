@@ -9,8 +9,9 @@ At-least-once delivery from the outbox plus an idempotent consumer gives
 > Work in progress. Done: M1 (foundations: event contract, interfaces, test harness),
 > M2 (walking skeleton: API → outbox → relay → Kafka → consumer), M3 (capture with
 > idempotency keys; relay with `SKIP LOCKED`, per-aggregate ordering, backoff and graceful
-> shutdown) and M4 (idempotent ledger consumer: double-entry postings, `processed_events`,
-> retries, DLQ, offsets committed after the DB commit).
+> shutdown), M4 (idempotent ledger consumer: double-entry postings, `processed_events`,
+> retries, DLQ, offsets committed after the DB commit) and M5 (crash scenario: F5 kills a
+> relay's backend between Kafka's ack and the mark; `make chaos` SIGKILLs relays under load).
 > See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, the failure-mode matrix
 > and the milestone plan.
 
@@ -51,6 +52,23 @@ the ledger:
 psql postgres://outbox:outbox@localhost:5432/outbox -c \
   'SELECT account, currency, sum(amount_minor) FROM ledger_entries GROUP BY 1, 2'
 ```
+
+### Demo and chaos
+
+Instead of the `run-*` terminals, the binaries can run as containers (one image, built from
+`deploy/Dockerfile`):
+
+```sh
+make up
+make app                # api on :8080, relay-1, relay-2, ledger-consumer
+make demo               # create + capture 100 payments, wait for the consumer, print the ledger
+make chaos              # SIGKILL relays at random while 2,000 payments go through
+```
+
+`make chaos` fails unless the ledger is exact afterwards: every capture posted exactly
+once, every transaction balanced, `psp:receivable` equal to the captured total. It also
+prints how many events the kills made the relays publish twice; the consumer skips them by
+`event_id`. `make down` removes the app containers too.
 
 Amounts are `int64` minor units (`1999` = €19.99). JavaScript clients lose precision above
 2^53, which is why some APIs send amounts as strings. Errors are RFC 9457 problem details;
