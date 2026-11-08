@@ -68,11 +68,11 @@ binary so you can scale it on its own and kill it in tests.
 │   ├── outbox/           # Queue (enqueue in caller's batch), BuildRecord, Producer iface, Relay
 │   │   └── outboxtest/   # FakeProducer
 │   ├── ledger/           # double-entry posting logic + repository
-│   ├── consumer/         # Handler iface, Permanent errors, DLQ iface; Processor/Runner (M4)
+│   ├── consumer/         # Handler iface, Permanent errors, DLQ iface; naive Poll (M2) → Processor/Runner (M4)
 │   │   └── consumertest/ # FakeDLQ
 │   ├── kafkax/           # outbox.Producer over franz-go, header carrier for OTel (M6)
 │   ├── telemetry/        # OTel tracer/meter providers, propagators
-│   ├── httpapi/          # handlers, middleware (otelhttp, request id, recovery)
+│   ├── httpapi/          # handlers, RFC 9457 problems, middleware (recovery, logging; otelhttp in M6)
 │   └── testenv/          # testcontainers harness (build tag: integration)
 ├── cmd/migrate/          # applies embedded migrations (used by `make up`)
 ├── migrations/           # goose SQL migrations, embedded; Up() shared by cmd/migrate and testenv
@@ -82,6 +82,7 @@ binary so you can scale it on its own and kill it in tests.
 │   └── docker-compose.yml  # postgres, redpanda (+ topic init), later jaeger and the 3 binaries
 ├── docs/
 │   ├── ARCHITECTURE.md
+│   ├── api-errors.md     # problem types, idempotency semantics
 │   └── adr/
 ├── Makefile
 └── .github/workflows/ci.yml
@@ -260,6 +261,9 @@ to mock it, and it is tested against real Postgres.
   `outbox.id` order can differ from commit order and the ordering guard in §7 breaks.
 - **API idempotency:** a unique violation on `idempotency_key` returns the existing payment
   with `200` instead of `201`. Client retries never create a second payment or a second event.
+  The same key with a different request gets `422` (not `409`: no "still in progress" state
+  is ever visible, because the key is claimed by the payment's own transaction). Errors are
+  RFC 9457 problem details. See [api-errors.md](api-errors.md).
 - Capture (`POST /payments/{id}/capture`) runs `SELECT ... FOR UPDATE` on the payment, checks
   the state transition, bumps `version`, and enqueues `payment.captured` in the same tx.
 
@@ -574,8 +578,8 @@ GitHub Actions: `golangci-lint` → unit tests (`-race`) → integration tests
 | Milestone | Deliverable | Done when |
 |---|---|---|
 | **M1 — Foundations** | repo skeleton, `money` + tests, migrations, docker-compose, CI; **event contract** (`internal/event` + golden files); **interfaces** (`outbox.Queue`/`Producer`/`Relay`, `consumer.Handler`/`DLQ`) with fakes; **harness** (`internal/testenv`) + smoke tests; F1–F10 stubs | `make up` works, lint, unit and integration tests green ✅ |
-| **M2 — Write path** | payments API (create/capture), `pgx.Batch` repo, API idempotency | F1–F3 tests pass |
-| **M3 — Relay** | claim/publish/mark loop, backoff, ordering guard, metrics | F4, F6, F9 tests pass |
+| **M2 — Walking skeleton** | `POST /payments` → `pgx.Batch` repo → naive relay (no `SKIP LOCKED`, no retries, single instance) → Kafka → consumer that only logs; UUIDv7 ids, RFC 9457 errors, API idempotency (same key + different body → 422) | F1–F3 and `TestEndToEnd_PaymentCreatedReachesConsumer` pass ✅ |
+| **M3 — Relay** | claim/publish/mark loop with `SKIP LOCKED`, backoff, ordering guard, metrics; capture endpoint (F9 needs a 2nd event per aggregate) | F4, F6, F9 tests pass |
 | **M4 — Consumer** | ledger double-entry, `processed_events`, retry + DLQ | F7, F8 tests pass |
 | **M5 — Crash scenario** | `Hooks.AfterPublish`, F5 test, `make chaos` | F5 test passes, chaos run leaves ledger balanced |
 | **M6 — Tracing** | OTel across all three services, Jaeger in compose | F10 test passes, screenshot in README |

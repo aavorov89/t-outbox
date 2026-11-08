@@ -1,6 +1,7 @@
 // Package consumer is the generic idempotent consumer: dedup by event_id in
 // processed_events, the side effect in the same transaction, retries, and DLQ.
-// Processor and Runner arrive in M4; the contracts below are fixed now.
+// Processor and Runner arrive in M4; the contracts below are fixed now. Until then Poll
+// (poll.go) is a naive loop that only logs.
 package consumer
 
 import (

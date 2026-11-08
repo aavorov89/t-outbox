@@ -1,5 +1,5 @@
-// Package kafkax holds franz-go setup: the outbox.Producer implementation and, from M6,
-// the OTel header carrier.
+// Package kafkax holds franz-go setup: producer and consumer options, the outbox.Producer
+// implementation and, from M6, the OTel header carrier.
 package kafkax
 
 import (
@@ -39,6 +39,20 @@ func ProducerOpts(brokers []string, deliveryTimeout time.Duration) []kgo.Opt {
 		kgo.ProduceRequestTimeout(deliveryTimeout / 2),
 		kgo.RequestTimeoutOverhead(deliveryTimeout / 2),
 		kgo.ProducerLinger(0),
+	}
+}
+
+// ConsumerOpts are the client options of a consumer-group member of group reading topic.
+// A new group starts at the beginning of the topic, so no event published before the first
+// start is missed. Offsets are auto-committed only for records the application marked
+// (kgo.AutoCommitMarks), i.e. after they were handled.
+func ConsumerOpts(brokers []string, group, topic string) []kgo.Opt {
+	return []kgo.Opt{
+		kgo.SeedBrokers(brokers...),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.AutoCommitMarks(),
 	}
 }
 

@@ -6,7 +6,7 @@ GOMODCACHE   := $(shell $(GO) env GOMODCACHE)
 LINT_CACHE   ?= $(HOME)/.cache/golangci-lint-docker
 UIDGID       := $(shell id -u):$(shell id -g)
 
-.PHONY: up down migrate test test-integration lint fmt tidy
+.PHONY: up down migrate run-api run-relay run-consumer test test-integration lint fmt tidy
 
 ## Local stack: postgres + redpanda (+ topics), then migrations.
 up:
@@ -19,6 +19,17 @@ down:
 
 migrate:
 	DATABASE_URL='$(DATABASE_URL)' $(GO) run ./cmd/migrate
+
+## The three binaries against the `make up` stack (one terminal each).
+KAFKA_BROKERS ?= localhost:19092
+run-api:
+	DATABASE_URL='$(DATABASE_URL)' $(GO) run ./cmd/payments-api
+
+run-relay:
+	DATABASE_URL='$(DATABASE_URL)' KAFKA_BROKERS='$(KAFKA_BROKERS)' $(GO) run ./cmd/outbox-relay
+
+run-consumer:
+	KAFKA_BROKERS='$(KAFKA_BROKERS)' $(GO) run ./cmd/ledger-consumer
 
 ## Unit tests only: no Docker needed.
 test:
