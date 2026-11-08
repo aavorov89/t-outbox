@@ -15,11 +15,12 @@ const problemTypeBase = "https://github.com/aavorov89/t-outbox/blob/main/docs/ap
 // Problem type URIs. Generic HTTP errors use "about:blank", for which RFC 9457 says the
 // title is the status phrase.
 const (
-	TypeMalformedRequest      = problemTypeBase + "malformed-request"
-	TypeValidation            = problemTypeBase + "validation-error"
-	TypeIdempotencyKeyMissing = problemTypeBase + "idempotency-key-missing"
-	TypeIdempotencyKeyReused  = problemTypeBase + "idempotency-key-reused"
-	TypeAboutBlank            = "about:blank"
+	TypeMalformedRequest       = problemTypeBase + "malformed-request"
+	TypeValidation             = problemTypeBase + "validation-error"
+	TypeIdempotencyKeyMissing  = problemTypeBase + "idempotency-key-missing"
+	TypeIdempotencyKeyReused   = problemTypeBase + "idempotency-key-reused"
+	TypeInvalidStateTransition = problemTypeBase + "invalid-state-transition"
+	TypeAboutBlank             = "about:blank"
 )
 
 // Problem is an RFC 9457 problem details object. Errors is an extension member used by

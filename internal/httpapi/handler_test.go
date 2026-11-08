@@ -25,6 +25,7 @@ import (
 type memStore struct {
 	mu        sync.Mutex
 	byKey     map[string]payment.Payment
+	events    []outbox.Message // written by Update
 	createErr error
 }
 
@@ -51,6 +52,27 @@ func (s *memStore) Get(_ context.Context, id uuid.UUID) (payment.Payment, error)
 		if p.ID == id {
 			return p, nil
 		}
+	}
+	return payment.Payment{}, payment.ErrNotFound
+}
+
+func (s *memStore) Update(_ context.Context, id uuid.UUID, fn payment.UpdateFunc) (payment.Payment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, p := range s.byKey {
+		if p.ID != id {
+			continue
+		}
+		next, msg, err := fn(p)
+		if err != nil {
+			return payment.Payment{}, err
+		}
+		if msg == nil {
+			return p, nil
+		}
+		s.byKey[key] = next
+		s.events = append(s.events, *msg)
+		return next, nil
 	}
 	return payment.Payment{}, payment.ErrNotFound
 }
@@ -230,3 +252,74 @@ func TestRecoverer(t *testing.T) {
 type panicStore struct{ memStore }
 
 func (*panicStore) Create(context.Context, payment.Payment, outbox.Message) error { panic("boom") }
+
+func capture(t *testing.T, h http.Handler, path, key string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, path+"/capture", nil)
+	if key != "" {
+		req.Header.Set(httpapi.HeaderIdempotencyKey, key)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestCapturePayment(t *testing.T) {
+	store := &memStore{}
+	h := newHandler(store)
+	created := post(t, h, "k1", "application/json", validBody)
+	require.Equal(t, http.StatusCreated, created.Code)
+	path := created.Header().Get("Location")
+
+	first := capture(t, h, path, "cap-1")
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	require.Empty(t, first.Header().Get(httpapi.HeaderIdempotentReplayed))
+	var got httpapi.PaymentResponse
+	require.NoError(t, json.Unmarshal(first.Body.Bytes(), &got))
+	require.Equal(t, "captured", got.Status)
+	require.Equal(t, 2, got.Version)
+	require.Len(t, store.events, 1)
+	require.Equal(t, 2, store.events[0].AggregateVersion)
+
+	t.Run("retry with the same key replays", func(t *testing.T) {
+		rec := capture(t, h, path, "cap-1")
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.Equal(t, "true", rec.Header().Get(httpapi.HeaderIdempotentReplayed))
+		require.JSONEq(t, first.Body.String(), rec.Body.String())
+		require.Len(t, store.events, 1, "no second event")
+	})
+
+	t.Run("another key conflicts", func(t *testing.T) {
+		rec := capture(t, h, path, "cap-2")
+		require.Equal(t, http.StatusConflict, rec.Code)
+		require.Equal(t, httpapi.TypeInvalidStateTransition, decodeProblem(t, rec).Type)
+		require.Len(t, store.events, 1)
+	})
+}
+
+func TestCapturePayment_Problems(t *testing.T) {
+	store := &memStore{}
+	h := newHandler(store)
+	created := post(t, h, "k1", "application/json", validBody)
+	require.Equal(t, http.StatusCreated, created.Code)
+	path := created.Header().Get("Location")
+
+	tests := []struct {
+		name, path, key string
+		status          int
+		typ             string
+	}{
+		{"missing key", path, "", 400, httpapi.TypeIdempotencyKeyMissing},
+		{"bad key", path, "a b", 400, httpapi.TypeIdempotencyKeyMissing},
+		{"unknown payment", "/payments/" + uuid.NewString(), "k", 404, httpapi.TypeAboutBlank},
+		{"not a uuid", "/payments/nope", "k", 404, httpapi.TypeAboutBlank},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := capture(t, h, tt.path, tt.key)
+			require.Equal(t, tt.status, rec.Code, rec.Body.String())
+			require.Equal(t, tt.typ, decodeProblem(t, rec).Type)
+		})
+	}
+	require.Empty(t, store.events)
+}

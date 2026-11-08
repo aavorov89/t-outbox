@@ -39,12 +39,13 @@ type received struct {
 	env event.Envelope
 }
 
-// The walking skeleton (M2): POST /payments → payment + outbox row in one tx → relay →
-// Kafka → consumer. All three components run in-process against real Postgres and Kafka.
-func TestEndToEnd_PaymentCreatedReachesConsumer(t *testing.T) {
+// The whole chain: POST /payments and POST /payments/{id}/capture → payment + outbox row
+// in one tx each → relay → Kafka → consumer. All three components run in-process against
+// real Postgres and Kafka.
+func TestEndToEnd_PaymentEventsReachConsumer(t *testing.T) {
 	testenv.NoLeaks(t)
 	log := slog.New(slog.NewTextHandler(t.Output(), nil))
-	pool := env.PG.NewPool(t, nil)
+	pool := env.PG.NewPool(t, outbox.ConfigurePool)
 	topic := env.Kafka.NewTopic(t, 3)
 
 	// API.
@@ -90,7 +91,7 @@ func TestEndToEnd_PaymentCreatedReachesConsumer(t *testing.T) {
 
 	var eventID uuid.UUID
 	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT event_id FROM outbox WHERE aggregate_id = $1`, created.ID.String()).Scan(&eventID))
+		`SELECT event_id FROM outbox WHERE aggregate_id = $1 AND aggregate_version = 1`, created.ID.String()).Scan(&eventID))
 
 	// 2. The consumer receives exactly that event.
 	var r received
@@ -133,10 +134,36 @@ func TestEndToEnd_PaymentCreatedReachesConsumer(t *testing.T) {
 		return err == nil && published
 	}, 10*time.Second, 50*time.Millisecond, "outbox row must be marked published")
 
-	// 4. Nothing else arrives: one payment, one event.
+	// 4. Capture it: payment.captured follows on the same partition.
+	req, err = http.NewRequestWithContext(ctx, http.MethodPost, api.URL+"/payments/"+created.ID.String()+"/capture", nil)
+	require.NoError(t, err)
+	req.Header.Set(httpapi.HeaderIdempotencyKey, uuid.NewString())
+	resp, err = api.Client().Do(req)
+	require.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+	var c received
+	select {
+	case c = <-got:
+	case <-time.After(30 * time.Second):
+		t.Fatal("consumer did not receive payment.captured within 30s")
+	}
+	require.Equal(t, event.TypePaymentCaptured, c.env.EventType)
+	require.Equal(t, created.ID.String(), c.env.AggregateID)
+	require.Equal(t, 2, c.env.AggregateVersion)
+	require.Equal(t, r.rec.Partition, c.rec.Partition, "one aggregate, one partition")
+	require.Greater(t, c.rec.Offset, r.rec.Offset, "captured after created")
+	captured, err := event.DecodeData[event.PaymentCapturedV1](c.env)
+	require.NoError(t, err)
+	require.Equal(t, data.Amount, captured.Amount)
+
+	// 5. Nothing else arrives: one payment, two events.
 	select {
 	case extra := <-got:
-		t.Fatalf("unexpected second event %s (%s)", extra.env.EventID, extra.env.EventType)
+		t.Fatalf("unexpected extra event %s (%s)", extra.env.EventID, extra.env.EventType)
 	case <-time.After(500 * time.Millisecond):
 	}
 }

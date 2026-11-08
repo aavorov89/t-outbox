@@ -12,8 +12,9 @@ import (
 	"github.com/aavorov89/t-outbox/internal/outbox"
 )
 
-// DefaultDeliveryTimeout bounds how long Produce waits for a record. The relay's
-// idle_in_transaction_session_timeout must be larger (see outbox.Relay).
+// DefaultDeliveryTimeout bounds how long Produce waits for a record. It is below
+// outbox.DefaultPublishTimeout, so the producer reports its own timeout error before the
+// relay's ctx deadline fires (see the timeout chain in package outbox).
 const DefaultDeliveryTimeout = 10 * time.Second
 
 // ProducerOpts are the client options the relay needs: idempotent producer (franz-go's

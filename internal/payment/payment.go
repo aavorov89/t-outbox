@@ -31,7 +31,28 @@ var (
 	// ErrDuplicateIdempotencyKey is returned by repositories when a payment with the
 	// same idempotency key already exists. Nothing was written.
 	ErrDuplicateIdempotencyKey = errors.New("payment: duplicate idempotency key")
+	// ErrInvalidTransition matches every *TransitionError.
+	ErrInvalidTransition = errors.New("payment: invalid state transition")
 )
+
+// TransitionError is returned when an action is not allowed in the payment's current
+// status. errors.Is(err, ErrInvalidTransition) is true for it.
+type TransitionError struct {
+	Action string // e.g. "capture"
+	From   Status
+	// AlreadyDone is true if the payment already is in the action's target state, reached
+	// by a different request (another idempotency key).
+	AlreadyDone bool
+}
+
+func (e *TransitionError) Error() string {
+	if e.AlreadyDone {
+		return fmt.Sprintf("payment: cannot %s: already %s by another request", e.Action, e.From)
+	}
+	return fmt.Sprintf("payment: cannot %s a payment in status %s", e.Action, e.From)
+}
+
+func (e *TransitionError) Is(target error) bool { return target == ErrInvalidTransition }
 
 // Payment is the aggregate. Version is +1 per emitted event, so it equals the
 // aggregate_version of the latest outbox event.
@@ -42,8 +63,11 @@ type Payment struct {
 	Amount         money.Money
 	Status         Status
 	Version        int
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// CaptureIdempotencyKey is the Idempotency-Key of the request that captured the
+	// payment; empty until then.
+	CaptureIdempotencyKey string
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }
 
 // New creates a payment in status created and its payment.created event (aggregate
@@ -111,6 +135,64 @@ func New(idempotencyKey, merchantID string, amount money.Money, now time.Time) (
 	}
 	return p, msg, nil
 }
+
+// Capture moves the payment from created to captured and returns the new state with its
+// payment.captured event (aggregate version +1). Callers must hold a lock on the payment
+// (see outbox.Message); the repository's Update does.
+//
+// Capture is idempotent per key: if the payment was already captured with idempotencyKey,
+// it returns p unchanged and a nil event, so a retried request writes nothing. Capturing
+// with another key, or from any status but created, is a *TransitionError.
+func (p Payment) Capture(idempotencyKey string, now time.Time) (Payment, *outbox.Message, error) {
+	if idempotencyKey == "" {
+		return Payment{}, nil, fmt.Errorf("%w: idempotency key is empty", ErrInvalid)
+	}
+	switch p.Status {
+	case StatusCreated:
+	case StatusCaptured:
+		if p.CaptureIdempotencyKey == idempotencyKey {
+			return p, nil, nil
+		}
+		return Payment{}, nil, &TransitionError{Action: "capture", From: p.Status, AlreadyDone: true}
+	default:
+		return Payment{}, nil, &TransitionError{Action: "capture", From: p.Status}
+	}
+
+	eventID, err := uuid.NewV7()
+	if err != nil {
+		return Payment{}, nil, fmt.Errorf("payment: new event id: %w", err)
+	}
+	now = now.UTC().Truncate(time.Microsecond)
+	next := p
+	next.Status = StatusCaptured
+	next.Version++
+	next.CaptureIdempotencyKey = idempotencyKey
+	next.UpdatedAt = now
+
+	data, err := json.Marshal(event.PaymentCapturedV1{
+		PaymentID:  p.ID,
+		MerchantID: p.MerchantID,
+		Amount:     wireAmount(p.Amount),
+	})
+	if err != nil {
+		return Payment{}, nil, fmt.Errorf("payment: encode event: %w", err)
+	}
+	return next, &outbox.Message{
+		EventID:          eventID,
+		AggregateType:    event.AggregatePayment,
+		AggregateID:      p.ID.String(),
+		AggregateVersion: next.Version,
+		EventType:        event.TypePaymentCaptured,
+		EventVersion:     1,
+		OccurredAt:       now,
+		Payload:          data,
+	}, nil
+}
+
+// UpdateFunc decides a state change of a locked payment p (see the repository's Update).
+// It returns the new state and the event that records it, or (p, nil, nil) to change
+// nothing, e.g. for an idempotent replay. A non-nil error aborts the update.
+type UpdateFunc func(p Payment) (Payment, *outbox.Message, error)
 
 // SameRequest reports whether a create request with these fields is the one that created
 // p. A retry with the same idempotency key must match it; otherwise the key was reused for

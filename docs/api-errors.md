@@ -38,15 +38,22 @@ field as a JSON Pointer (RFC 6901) into the request body.
 
 ### idempotency-key-missing
 
-`400`. `POST /payments` without an `Idempotency-Key` header, or with a key that is longer
+`400`. `POST /payments` or `POST /payments/{id}/capture` without an `Idempotency-Key` header, or with a key that is longer
 than 255 characters or contains anything other than printable ASCII without spaces.
-Generate one key per payment on the client (a UUID is fine) and reuse it for every retry
-of that payment.
+Generate one key per operation on the client (a UUID is fine) and reuse it for every
+retry of that operation.
 
 ### idempotency-key-reused
 
 `422`. The `Idempotency-Key` was already used for a payment with a **different** request
 (merchant, amount or currency). Nothing was created. A new payment needs a new key.
+
+### invalid-state-transition
+
+`409`. The payment's current state does not allow the action: it was already captured by
+a request with a **different** `Idempotency-Key`, or it is not in status `created`.
+Nothing was changed. `GET /payments/{id}` shows the current state. Retrying with the same
+key cannot succeed.
 
 ## Idempotency semantics of `POST /payments`
 
@@ -82,3 +89,22 @@ transaction commits, the duplicate fails with a unique violation and reads the c
 payment. If it rolls back, the duplicate creates the payment itself. No intermediate
 "in progress" state is ever visible. APIs that store the key in a separate table or in
 Redis before doing the work need the 409.
+
+## Idempotency semantics of `POST /payments/{id}/capture`
+
+Capture takes no body and captures the full amount.
+
+| Situation | Response |
+|---|---|
+| Payment `created` | `200 OK`, status `captured`, one `payment.captured` event |
+| Already captured with this key (retry) | `200 OK`, the stored payment, `Idempotent-Replayed: true`, no event |
+| Already captured with another key | `409` `invalid-state-transition` |
+| Payment in another status | `409` `invalid-state-transition` |
+| Unknown payment | `404` |
+| Concurrent captures | One performs it; same-key requests get the replay, others `409` |
+
+The key is stored on the payment (`capture_idempotency_key`) in the transaction that
+changes its status and writes the event, and that transaction holds `SELECT ... FOR
+UPDATE` on the payment. A concurrent capture waits for the lock and then sees the
+committed result, so here too no "in progress" `409` is ever needed. Capture keys are
+scoped to the payment: the same key on two payments captures both.

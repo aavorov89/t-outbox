@@ -146,6 +146,7 @@ CREATE TABLE payments (
     currency         CHAR(3) NOT NULL,
     status           TEXT NOT NULL,                   -- created | captured | failed
     version          INT  NOT NULL,                   -- aggregate version, +1 per event
+    capture_idempotency_key TEXT,                     -- set iff status = 'captured' (00002)
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -195,7 +196,7 @@ CREATE TABLE ledger_entries (
 a database guarantee and catches concurrent writers to one aggregate.
 
 The full schema (with `CHECK`s on `payments` and `ledger_entries`) is in
-`migrations/00001_init.sql`.
+`migrations/00001_init.sql` and `00002_capture_idempotency_key.sql`.
 
 Cleanup: a periodic `DELETE FROM outbox WHERE published_at < now() - interval '7 days'`
 in batches. The ADR notes partitioning by `created_at` as the high-volume option.
@@ -264,8 +265,16 @@ to mock it, and it is tested against real Postgres.
   The same key with a different request gets `422` (not `409`: no "still in progress" state
   is ever visible, because the key is claimed by the payment's own transaction). Errors are
   RFC 9457 problem details. See [api-errors.md](api-errors.md).
-- Capture (`POST /payments/{id}/capture`) runs `SELECT ... FOR UPDATE` on the payment, checks
-  the state transition, bumps `version`, and enqueues `payment.captured` in the same tx.
+- **Capture** (`POST /payments/{id}/capture`, also with `Idempotency-Key`) goes through
+  `Repo.Update(ctx, id, fn)`: `SELECT ... FOR UPDATE` on the payment, then
+  `payment.Capture(key, now)` decides, then `UPDATE payments` + `outbox.Queue` in one batch.
+  Every state change goes through `Update`, so the writer invariant holds by construction;
+  `Update` also rejects a change whose version is not exactly +1 or whose event doesn't match.
+- **Capture idempotency:** the key is stored on the payment (`capture_idempotency_key`) in
+  the same tx as the status change. Captured with this key → `200` +
+  `Idempotent-Replayed: true`, no write. Captured with another key, or not in `created`
+  → `409` `invalid-state-transition`. Concurrent captures queue on the row lock: one emits
+  `payment.captured`, the rest see the result.
 
 ---
 
@@ -298,25 +307,70 @@ Different aggregates are still processed in parallel.
 ### Loop (one worker)
 
 ```
-loop:
+loop (until ctx is cancelled):
   BEGIN
     rows := claim(batchSize)                   -- locks held until COMMIT
     if empty: COMMIT; sleep(pollInterval); continue
-    results := producer.ProduceSync(records)   -- idempotent producer, acks=all
+    errs := producer.Produce(ctx + PublishTimeout, records)
+    -- one round trip:
     UPDATE outbox SET published_at = now()             WHERE id = ANY(ok_ids)
     UPDATE outbox SET attempts = attempts + 1,
-                      next_attempt_at = now() + backoff(attempts),
-                      last_error = $err                WHERE id = ANY(failed_ids)
+                      next_attempt_at = now() + backoff(attempts + 1),
+                      last_error = $err                FROM unnest(failed_ids, delays, errs)
   COMMIT
+  full batch → next cycle at once; otherwise sleep(pollInterval)
 ```
 
 Design choices:
 - **Locks stay held during publish (tx open).** If the worker dies, Postgres rolls back and
   releases the rows automatically. No lease bookkeeping. The lease-based alternative
   (`locked_until` column, short transactions) is described in an ADR.
-- **Timeouts.** Publishing time counts as idle in transaction, so
-  `kafkax.DefaultDeliveryTimeout` (10s) < `idle_in_transaction_session_timeout` (30s, set on
-  the relay pool via `RuntimeParams`).
+- **Per-record failures.** A record that fails to publish, or a row that can't be turned
+  into a record at all (hand-written, fails envelope validation), is rescheduled with its
+  own backoff (jitter per row) and its error in `last_error`; the rest of the batch is
+  marked. `RunOnce` reports them as `*PublishError` after the commit. A failing event blocks
+  only its own aggregate: the guard keeps later events of it unclaimed (`attempts = 0`).
+- **Cycle failures** (DB down, tx aborted) roll back everything. `Run` logs them and retries
+  after `Backoff(consecutive failures)` instead of spinning at `PollInterval`.
+- **Relay failures are infrastructure failures** (broker down), not poison messages, so the
+  relay retries forever with capped exponential backoff and jitter. There is no DLQ on the
+  producer side. Alerting uses the lag metric.
+- **Producer:** franz-go with idempotence on and `acks=all`, behind the `outbox.Producer`
+  interface: `Produce(ctx, []Record) []error`, one error per record by index, which maps
+  directly to `ok_ids` / `failed_ids`. Records are built with
+  `key=aggregate_id`, so per-aggregate order is also kept inside the Kafka partition.
+- Optional: `LISTEN/NOTIFY` wake-up to cut latency below `pollInterval`.
+
+### Batch size and poll interval
+
+- **`BatchSize` (100)** bounds the rows locked by one worker, the records in one `Produce`
+  call and the size of the mark round trip. A batch is as slow as its slowest record, and
+  a failure makes the whole batch wait for the delivery timeout, so bigger is not always
+  better. Because of the guard, **a batch holds at most one event per aggregate**: an
+  aggregate with k pending events needs k cycles, whatever the batch size.
+- **`PollInterval` (200ms)** is the latency when idle and the idle query load
+  (workers / interval claims per second, each an index scan of the pending rows). A full
+  batch skips the sleep, so a backlog drains at full speed. Below ~50ms, `LISTEN/NOTIFY`
+  is the better tool.
+- Both are set per process: `RELAY_BATCH_SIZE`, `RELAY_POLL_INTERVAL`.
+
+### Timeouts: idle_in_transaction_session_timeout vs. the producer
+
+Publishing happens inside the claiming tx, and Postgres counts that time as idle in
+transaction. The timeouts are therefore chained, inner to outer:
+
+| Timeout | Value | Bounds | Set in |
+|---|---|---|---|
+| franz-go delivery timeout | 10s | one record (enforced, see below) | `kafkax.DefaultDeliveryTimeout` |
+| `Config.PublishTimeout` | 15s | one `Produce` call, any `Producer` | ctx deadline in `RunOnce` |
+| `idle_in_transaction_session_timeout` | 30s | a relay that froze mid-batch (GC, SIGSTOP, partition) | `outbox.ConfigurePool` (`RuntimeParams`) |
+
+If the server timeout fired before a healthy but slow publish ended, the server would kill
+the session after the records landed: the mark is lost and every slow batch is published
+twice (`TestRelay_PublishPastIdleTimeoutRollsBack` shows it). So `Run` reads the setting
+at start-up and **refuses to run if it is not greater than `PublishTimeout`**; `0`
+(disabled) only gets a warning.
+
 - **The delivery timeout must really fire.** By default franz-go never fails an idempotent
   record that is already in flight: with a hung broker, `ProduceSync` blocks until the
   broker answers, ignoring `RecordDeliveryTimeout` and ctx (seen in the harness smoke test).
@@ -325,32 +379,46 @@ Design choices:
   flight may still have landed, so the retry can duplicate it. That is the same
   at-least-once duplicate as F5, which the consumer dedups. Ordering is not affected: the
   next event of an aggregate is claimed only after the previous one is marked published.
-- **Producer:** franz-go with idempotence on and `acks=all`, behind the `outbox.Producer`
-  interface: `Produce(ctx, []Record) []error`, one error per record by index, which maps
-  directly to `ok_ids` / `failed_ids`. Records are built with
-  `key=aggregate_id`, so per-aggregate order is also kept inside the Kafka partition.
-- **Relay failures are infrastructure failures** (broker down), not poison messages, so the
-  relay retries forever with capped exponential backoff and jitter. There is no DLQ on the
-  producer side. Alerting uses the lag metric.
-- Optional: `LISTEN/NOTIFY` wake-up to cut latency below `pollInterval`.
+
+### Stopping a worker mid-batch
+
+Cancelling a batch halfway is always *safe* (the tx rolls back, rows stay pending) but
+not free: records that already landed are published again by the next relay. So `Run`
+shuts down gracefully:
+
+1. On ctx cancellation (SIGTERM), `Run` stops claiming and stops sleeping.
+2. The in-flight cycle runs on `context.WithoutCancel(ctx)`, so `Produce`, the mark and
+   the `COMMIT` complete: no loss, no duplicate.
+3. That is bounded by **`DrainTimeout`** (default `PublishTimeout` + 5s = 20s, below the
+   default 30s Kubernetes grace period). Past it, the cycle's context is cancelled: the tx
+   rolls back and its rows stay pending with no attempt counted (shutdown is not a broker
+   failure). The relay logs it; the next relay publishes them, possibly as duplicates.
+4. `kill -9` skips all of this and is still safe: Postgres releases the locks when the
+   connection drops (F5).
+
+`RunOnce` has no drain: cancelling its ctx aborts at once. Tests use that for crash-like
+steps.
 
 ### Relay API
 
 ```go
 func NewRelay(pool *pgxpool.Pool, p Producer, cfg Config) *Relay
-func (r *Relay) Run(ctx context.Context) error            // loops until ctx is cancelled
+func (r *Relay) Run(ctx context.Context) error            // loops until ctx is cancelled, drains, returns nil
 func (r *Relay) RunOnce(ctx context.Context) (int, error) // one claim/publish/mark cycle; tests step with it
+func ConfigurePool(c *pgxpool.Config)                     // idle_in_transaction_session_timeout, application_name
 
 type Config struct {
-    Topic        string        // tests use a unique topic each
-    BatchSize    int
-    PollInterval time.Duration
-    Backoff      Backoff       // func(attempt int) time.Duration; ExpBackoff = capped exp + equal jitter
-    Hooks        Hooks         // test-only seams, nil in production
+    Topic          string        // tests use a unique topic each
+    BatchSize      int           // 100
+    PollInterval   time.Duration // 200ms
+    PublishTimeout time.Duration // 15s; must be < idle_in_transaction_session_timeout
+    DrainTimeout   time.Duration // 20s; how long a shutdown waits for the in-flight batch
+    Backoff        Backoff       // func(attempt int) time.Duration; ExpBackoff = capped exp + equal jitter
+    Hooks          Hooks         // test-only seams, nil in production
 }
 ```
 
-### Metrics (Prometheus)
+### Metrics (M6)
 `outbox_pending_total`, `outbox_oldest_pending_age_seconds` (the main SLO signal),
 `outbox_publish_duration_seconds`, `outbox_publish_failures_total`.
 
@@ -445,9 +513,9 @@ This is the core of the README: each row maps to an integration test.
 
 | # | Where the crash or failure happens | What happens | Why it's safe | Test |
 |---|---|---|---|---|
-| F1 | API dies before COMMIT | Nothing persisted | Single tx | `TestWrite_Atomicity` |
-| F2 | Outbox insert fails (e.g. constraint) | Payment rolled back too | Single tx | `TestWrite_OutboxFailureRollsBackPayment` |
-| F3 | Client retries POST | Same payment, no 2nd event | Unique `idempotency_key` | `TestAPI_IdempotencyKey` |
+| F1 | API dies before COMMIT (create or capture) | Nothing persisted | Single tx | `TestWrite_Atomicity` |
+| F2 | Outbox insert fails (e.g. constraint) | Payment write rolled back too | Single tx | `TestWrite_OutboxFailureRollsBackPayment` |
+| F3 | Client retries POST (create or capture) | Same payment, no 2nd event | Unique `idempotency_key`; capture key + row lock | `TestAPI_IdempotencyKey`, `TestAPI_CaptureIdempotencyKey` |
 | F4 | Two relays poll at once | Disjoint row sets | Row locks + `SKIP LOCKED` | `TestRelay_ConcurrentWorkersNoDoubleClaim` |
 | F5 | **Relay dies after publish, before mark** | Row unlocked, re-published, so Kafka holds a duplicate | Consumer dedups by `event_id` | `TestRelay_CrashAfterPublishBeforeMark` |
 | F6 | Kafka unavailable | Rows stay pending, `attempts` grows, published after recovery | Backoff, durable outbox | `TestRelay_BrokerOutage` |
@@ -530,11 +598,21 @@ separate conn, using the PID captured at claim time) is closer to a real crash t
 returning an error. The worker's tx dies on the server side, as it would after a `kill -9`.
 
 ### Other test notes
-- **F4:** 8 workers, 1,000 events. Assert that every `event_id` is published and that no
-  row was claimed twice at the same moment (each worker records claimed IDs, and the
-  intersections of in-flight sets are empty). Also run with `-race`.
-- **F6:** `env.Kafka.Pause(t)` → assert `attempts > 0` and `published_at IS NULL` →
-  `env.Kafka.Unpause(t)` → `require.Eventually` published.
+- **F4:** 8 workers, 1,000 events (200 aggregates × 5), `FakeProducer`. Assert that no
+  row was claimed twice at the same moment (each worker records claimed IDs in
+  `AfterClaim` and removes them after `COMMIT`; the in-flight sets never intersect), that
+  every event is published exactly once, and in version order per aggregate. Run with `-race`.
+- **F6:** `env.Kafka.Pause(t)` → assert `attempts >= 2`, `last_error` set,
+  `published_at IS NULL`, and the aggregate's next event not even claimed →
+  `env.Kafka.Unpause(t)` → `require.Eventually` published; Kafka holds every event, first
+  occurrences in order. Not parallel: it pauses the package's shared broker.
+- **F9:** 4 relays on a 4-partition topic, 20 aggregates × 10 events written while they
+  run, 30% of publishes failing at random before Kafka. Assert each key sits in one
+  partition with versions exactly 1..10 in offset order. Without the guard, a relay would
+  publish v+1 while v backs off.
+- Relay unit-level tests (`FakeProducer`): reschedule with backoff, ordering guard and
+  head-of-line blocking, unbuildable rows, idle-timeout check, publish past the idle
+  timeout, graceful shutdown and drain timeout (with `NoLeaks`).
 - **F10:** `tracetest.NewInMemoryExporter()` for all three components in-process. Assert one trace ID
   and the parent/child chain.
 - Unit tests (no containers) for `money`, the payment state machine, the backoff policy, and error classification.
@@ -578,11 +656,11 @@ GitHub Actions: `golangci-lint` → unit tests (`-race`) → integration tests
 | Milestone | Deliverable | Done when |
 |---|---|---|
 | **M1 — Foundations** | repo skeleton, `money` + tests, migrations, docker-compose, CI; **event contract** (`internal/event` + golden files); **interfaces** (`outbox.Queue`/`Producer`/`Relay`, `consumer.Handler`/`DLQ`) with fakes; **harness** (`internal/testenv`) + smoke tests; F1–F10 stubs | `make up` works, lint, unit and integration tests green ✅ |
-| **M2 — Walking skeleton** | `POST /payments` → `pgx.Batch` repo → naive relay (no `SKIP LOCKED`, no retries, single instance) → Kafka → consumer that only logs; UUIDv7 ids, RFC 9457 errors, API idempotency (same key + different body → 422) | F1–F3 and `TestEndToEnd_PaymentCreatedReachesConsumer` pass ✅ |
-| **M3 — Relay** | claim/publish/mark loop with `SKIP LOCKED`, backoff, ordering guard, metrics; capture endpoint (F9 needs a 2nd event per aggregate) | F4, F6, F9 tests pass |
+| **M2 — Walking skeleton** | `POST /payments` → `pgx.Batch` repo → naive relay (no `SKIP LOCKED`, no retries, single instance) → Kafka → consumer that only logs; UUIDv7 ids, RFC 9457 errors, API idempotency (same key + different body → 422) | F1–F3 and the end-to-end test pass ✅ |
+| **M3 — Hardening the write path and the relay** | capture endpoint with `Idempotency-Key` (`Repo.Update` under `FOR UPDATE`); claim/publish/mark in one tx with `SKIP LOCKED` + `NOT EXISTS` ordering guard, per-record backoff, timeout chain checked at start-up, graceful shutdown with drain timeout. Metrics move to M6 (OTel meters) | F1–F4, F6, F9 pass; `TestEndToEnd_PaymentEventsReachConsumer` covers create + capture ✅ |
 | **M4 — Consumer** | ledger double-entry, `processed_events`, retry + DLQ | F7, F8 tests pass |
 | **M5 — Crash scenario** | `Hooks.AfterPublish`, F5 test, `make chaos` | F5 test passes, chaos run leaves ledger balanced |
-| **M6 — Tracing** | OTel across all three services, Jaeger in compose | F10 test passes, screenshot in README |
+| **M6 — Tracing and metrics** | OTel across all three services, Jaeger in compose; relay metrics from §7 | F10 test passes, screenshot in README |
 | **M7 — Polish** | README (diagram, guarantees, failure matrix), ADRs, simple load numbers | A reviewer gets the point in 2 minutes |
 
 **README order:** one-line pitch → diagram → "Guarantees" → failure-mode matrix with

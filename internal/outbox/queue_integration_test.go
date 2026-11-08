@@ -22,7 +22,7 @@ import (
 var env *testenv.Env
 
 func TestMain(m *testing.M) {
-	testenv.Main(m, &env, testenv.WithPostgres())
+	testenv.Main(m, &env, testenv.WithPostgres(), testenv.WithKafka())
 }
 
 func message(aggID string, version int, payload string) outbox.Message {

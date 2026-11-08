@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
@@ -85,18 +86,11 @@ func TestRepo_DuplicateIdempotencyKey(t *testing.T) {
 	require.Equal(t, 1, nOut, "the duplicate's event must not be written")
 }
 
-// F1: the API dies before COMMIT → neither the payment nor the outbox row exists.
-// The hook kills the transaction's own backend from a side connection, as a crash of the
-// API process would: the server aborts the tx, nothing is committed.
-func TestWrite_Atomicity(t *testing.T) {
-	t.Parallel()
-	dsn := env.PG.NewDatabase(t)
-	pool, err := pgxpool.New(context.Background(), dsn)
-	require.NoError(t, err)
-	t.Cleanup(pool.Close)
-	side := testenv.Connect(t, dsn)
-
-	repo := postgres.New(pool)
+// killBeforeCommit makes the repo's next transactions die before COMMIT: the hook kills
+// the transaction's own backend from a side connection, as a crash of the API process
+// would. The server aborts the tx, nothing is committed.
+func killBeforeCommit(t *testing.T, repo *postgres.Repo, side *pgx.Conn) {
+	t.Helper()
 	postgres.SetBeforeCommit(repo, func(ctx context.Context, tx pgx.Tx) error {
 		var pid int
 		if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
@@ -112,17 +106,56 @@ func TestWrite_Atomicity(t *testing.T) {
 		}
 		return nil // proceed to COMMIT on a dead connection
 	})
+}
 
-	p, msg := newPayment(t, "key-f1")
-	require.Error(t, repo.Create(context.Background(), p, msg))
+func capture(key string) payment.UpdateFunc {
+	return func(p payment.Payment) (payment.Payment, *outbox.Message, error) {
+		return p.Capture(key, time.Now())
+	}
+}
 
-	nPay, nOut := counts(t, pool)
-	require.Zero(t, nPay)
-	require.Zero(t, nOut)
+// F1: the API dies before COMMIT → nothing of that request is persisted: neither the
+// payment and its event on create, nor the status change and its event on capture.
+func TestWrite_Atomicity(t *testing.T) {
+	t.Parallel()
+	dsn := env.PG.NewDatabase(t)
+	pool, err := pgxpool.New(context.Background(), dsn)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	side := testenv.Connect(t, dsn)
+	ctx := context.Background()
+
+	t.Run("create", func(t *testing.T) {
+		repo := postgres.New(pool)
+		killBeforeCommit(t, repo, side)
+		p, msg := newPayment(t, "key-f1")
+		require.Error(t, repo.Create(ctx, p, msg))
+
+		nPay, nOut := counts(t, pool)
+		require.Zero(t, nPay)
+		require.Zero(t, nOut)
+	})
+
+	t.Run("capture", func(t *testing.T) {
+		repo := postgres.New(pool)
+		p, msg := newPayment(t, "key-f1-capture")
+		require.NoError(t, repo.Create(ctx, p, msg))
+		killBeforeCommit(t, repo, side)
+
+		_, err := repo.Update(ctx, p.ID, capture("cap"))
+		require.Error(t, err)
+
+		got, err := postgres.New(pool).Get(ctx, p.ID)
+		require.NoError(t, err)
+		require.Equal(t, p, got, "status change rolled back")
+		nPay, nOut := counts(t, pool)
+		require.Equal(t, 1, nPay)
+		require.Equal(t, 1, nOut, "no payment.captured row")
+	})
 }
 
 // F2: the outbox insert fails (here: an event_id that already exists) → the payment
-// rolls back too.
+// write rolls back too, on create and on capture.
 func TestWrite_OutboxFailureRollsBackPayment(t *testing.T) {
 	t.Parallel()
 	pool := env.PG.NewPool(t, nil)
@@ -132,15 +165,87 @@ func TestWrite_OutboxFailureRollsBackPayment(t *testing.T) {
 	p1, m1 := newPayment(t, "key-a")
 	require.NoError(t, repo.Create(ctx, p1, m1))
 
-	p2, m2 := newPayment(t, "key-b")
-	m2.EventID = m1.EventID // outbox UNIQUE (event_id) violation
-	err := repo.Create(ctx, p2, m2)
-	require.Error(t, err)
-	require.NotErrorIs(t, err, payment.ErrDuplicateIdempotencyKey)
+	t.Run("create", func(t *testing.T) {
+		p2, m2 := newPayment(t, "key-b")
+		m2.EventID = m1.EventID // outbox UNIQUE (event_id) violation
+		err := repo.Create(ctx, p2, m2)
+		require.Error(t, err)
+		require.NotErrorIs(t, err, payment.ErrDuplicateIdempotencyKey)
 
-	_, err = repo.Get(ctx, p2.ID)
-	require.ErrorIs(t, err, payment.ErrNotFound, "payment must roll back with its event")
-	nPay, nOut := counts(t, pool)
-	require.Equal(t, 1, nPay)
+		_, err = repo.Get(ctx, p2.ID)
+		require.ErrorIs(t, err, payment.ErrNotFound, "payment must roll back with its event")
+		nPay, nOut := counts(t, pool)
+		require.Equal(t, 1, nPay)
+		require.Equal(t, 1, nOut)
+	})
+
+	t.Run("capture", func(t *testing.T) {
+		_, err := repo.Update(ctx, p1.ID, func(p payment.Payment) (payment.Payment, *outbox.Message, error) {
+			next, msg, err := p.Capture("cap", time.Now())
+			if err == nil {
+				msg.EventID = m1.EventID
+			}
+			return next, msg, err
+		})
+		require.Error(t, err)
+
+		got, err := repo.Get(ctx, p1.ID)
+		require.NoError(t, err)
+		require.Equal(t, p1, got, "status change must roll back with its event")
+		_, nOut := counts(t, pool)
+		require.Equal(t, 1, nOut)
+	})
+}
+
+func TestRepo_UpdateCapture(t *testing.T) {
+	t.Parallel()
+	pool := env.PG.NewPool(t, nil)
+	repo := postgres.New(pool)
+	ctx := context.Background()
+	p, msg := newPayment(t, "key-1")
+	require.NoError(t, repo.Create(ctx, p, msg))
+
+	captured, err := repo.Update(ctx, p.ID, capture("cap-1"))
+	require.NoError(t, err)
+	require.Equal(t, payment.StatusCaptured, captured.Status)
+	require.Equal(t, 2, captured.Version)
+	got, err := repo.Get(ctx, p.ID)
+	require.NoError(t, err)
+	require.Equal(t, captured, got, "read back exactly what was written")
+
+	replayed, err := repo.Update(ctx, p.ID, capture("cap-1"))
+	require.NoError(t, err)
+	require.Equal(t, captured, replayed)
+
+	_, err = repo.Update(ctx, p.ID, capture("cap-2"))
+	require.ErrorIs(t, err, payment.ErrInvalidTransition)
+
+	rows, err := pool.Query(ctx, `SELECT event_type || ':' || aggregate_version FROM outbox ORDER BY id`)
+	require.NoError(t, err)
+	events, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	require.NoError(t, err)
+	require.Equal(t, []string{"payment.created:1", "payment.captured:2"}, events)
+
+	_, err = repo.Update(ctx, uuid.New(), capture("cap-1"))
+	require.ErrorIs(t, err, payment.ErrNotFound)
+}
+
+// Update refuses a change that breaks the aggregate's version contract, before writing.
+func TestRepo_UpdateRejectsVersionSkip(t *testing.T) {
+	t.Parallel()
+	pool := env.PG.NewPool(t, nil)
+	repo := postgres.New(pool)
+	ctx := context.Background()
+	p, msg := newPayment(t, "key-1")
+	require.NoError(t, repo.Create(ctx, p, msg))
+
+	_, err := repo.Update(ctx, p.ID, func(p payment.Payment) (payment.Payment, *outbox.Message, error) {
+		next, msg, err := p.Capture("cap", time.Now())
+		next.Version++
+		msg.AggregateVersion++
+		return next, msg, err
+	})
+	require.ErrorContains(t, err, "want +1")
+	_, nOut := counts(t, pool)
 	require.Equal(t, 1, nOut)
 }
