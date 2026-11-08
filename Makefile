@@ -29,7 +29,7 @@ run-relay:
 	DATABASE_URL='$(DATABASE_URL)' KAFKA_BROKERS='$(KAFKA_BROKERS)' $(GO) run ./cmd/outbox-relay
 
 run-consumer:
-	KAFKA_BROKERS='$(KAFKA_BROKERS)' $(GO) run ./cmd/ledger-consumer
+	DATABASE_URL='$(DATABASE_URL)' KAFKA_BROKERS='$(KAFKA_BROKERS)' $(GO) run ./cmd/ledger-consumer
 
 ## Unit tests only: no Docker needed.
 test:

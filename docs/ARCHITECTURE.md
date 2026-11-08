@@ -67,10 +67,11 @@ binary so you can scale it on its own and kill it in tests.
 │   ├── event/            # wire contract: Envelope, Encode/Decode, header keys, golden files
 │   ├── outbox/           # Queue (enqueue in caller's batch), BuildRecord, Producer iface, Relay
 │   │   └── outboxtest/   # FakeProducer
-│   ├── ledger/           # double-entry posting logic + repository
-│   ├── consumer/         # Handler iface, Permanent errors, DLQ iface; naive Poll (M2) → Processor/Runner (M4)
+│   ├── ledger/           # double-entry posting rules, balance invariant, ledger.Handler
+│   ├── consumer/         # Handler iface, error classification, DLQ iface; Processor + Runner
 │   │   └── consumertest/ # FakeDLQ
-│   ├── kafkax/           # outbox.Producer over franz-go, header carrier for OTel (M6)
+│   ├── backoff/          # capped exponential backoff with jitter (relay and consumer)
+│   ├── kafkax/           # outbox.Producer and consumer.DLQ over franz-go, header carrier for OTel (M6)
 │   ├── telemetry/        # OTel tracer/meter providers, propagators
 │   ├── httpapi/          # handlers, RFC 9457 problems, middleware (recovery, logging; otelhttp in M6)
 │   └── testenv/          # testcontainers harness (build tag: integration)
@@ -96,8 +97,9 @@ Integration tests of one component live next to it (`*_integration_test.go`,
 `//go:build integration`). Only tests that span several binaries live in `test/e2e/`.
 
 **Dependency rule:** `event` imports nothing internal. `outbox` and `consumer` import
-`event` but not each other. `kafkax` implements `outbox.Producer` (interfaces are declared
-by the package that consumes them).
+`event` but not each other. `kafkax` implements `outbox.Producer` and `consumer.DLQ`
+(interfaces are declared by the package that consumes them). `ledger` implements
+`consumer.Handler`.
 
 ---
 
@@ -430,13 +432,16 @@ type Config struct {
 
 ```
 for each record (partition order):
-  BEGIN
-    INSERT INTO processed_events(consumer, event_id) VALUES ('ledger', $id)
-      ON CONFLICT DO NOTHING
-    if rowsAffected == 0: COMMIT; continue          -- duplicate, already applied
-    ledger.Post(tx, debit, credit)                  -- side effect, same tx
-  COMMIT
-commit Kafka offsets (after DB commit)
+  decode envelope                                   -- malformed → permanent, straight to DLQ
+  attempt (≤ MaxAttempts, backoff between):
+    BEGIN
+      INSERT INTO processed_events(consumer, event_id) VALUES ('ledger', $id)
+        ON CONFLICT DO NOTHING
+      if rowsAffected == 0: COMMIT; done             -- duplicate, already applied
+      handler.Handle(tx, env)                        -- side effect, same tx
+    COMMIT
+  failed for good → DLQ
+commit Kafka offsets (after the DB commit / the DLQ ack)
 ```
 
 The dedup marker and the side effect commit **atomically**. That is why this project uses
@@ -451,6 +456,29 @@ a `processed_events` table and not Redis `SETNX`:
 Redis is fine when the side effect is itself idempotent or non-transactional, such as
 sending a notification with a dedup TTL. The ADR covers this.
 
+A failed attempt rolls back the marker too, so a record that ends in the DLQ leaves no
+trace in `processed_events` and a replay can still apply it. Two members processing the
+same event at once (rebalance overlap) are safe: the second `INSERT` waits on the first
+transaction's row, then sees the marker. Events without a ledger effect (`payment.created`,
+unknown types) are marked as processed and otherwise ignored.
+
+### Ledger postings
+
+`ledger.Handler` posts one transaction per `payment.captured` v1, signed minor units
+(+ debit, − credit):
+
+| Account | Amount | Meaning |
+|---|---|---|
+| `psp:receivable` | +amount | the PSP owes us the captured funds (asset) |
+| `merchant:{id}:payable` | −amount | we owe the merchant (liability) |
+
+- `transaction_id = UUIDv5(event_id)`: one event maps to one transaction by construction,
+  so a double application (if dedup ever broke) shows as the same id posted twice.
+- `Transaction.Validate` enforces ≥ 2 entries, no zero amounts and, per currency, a sum of
+  exactly zero with overflow-checked addition. `ledger.CheckBalanced` checks the whole
+  table with a `NUMERIC` sum; tests call it after every scenario.
+- Unknown `event_version`, unknown currency, non-positive amount, empty merchant → permanent.
+
 ### Consumer API
 
 ```go
@@ -459,29 +487,95 @@ type Handler interface {
     Handle(ctx context.Context, tx pgx.Tx, env event.Envelope) error
 }
 func Permanent(err error) error   // not retryable → DLQ right away; any other error is transient
-func IsPermanent(err error) bool  // also true for event.ErrMalformed
+func IsPermanent(err error) bool  // also event.ErrMalformed and data-caused PG errors (below)
 
 type DLQ interface {
     Send(ctx context.Context, rec *kgo.Record, cause error, attempts int) error
 }
+
+// Processor: dedup + tx + retries + classification. Needs only Postgres.
+func NewProcessor(pool *pgxpool.Pool, h Handler, cfg ProcessorConfig) *Processor
+func (p *Processor) Process(ctx context.Context, rec *kgo.Record) (Result, error)
+//   nil: applied now or before (Result.Duplicate); permanent; ErrRetriesExhausted; or ctx's error
+
+// Runner: franz-go poll loop, DLQ, offset commits. Owns its client.
+func NewRunner(p *Processor, dlq DLQ, cfg RunnerConfig, opts ...kgo.Opt) *Runner
+func (r *Runner) Run(ctx context.Context) error // nil on ctx cancel; closes the client
+
+type ProcessorConfig struct {
+    Consumer       string        // processed_events key, e.g. "ledger"
+    MaxAttempts    int           // 5, the first attempt included
+    AttemptTimeout time.Duration // 10s per transaction
+    Backoff        backoff.Func  // 100ms..2s
+}
+type RunnerConfig struct {
+    MaxPollRecords  int           // 100: work between commits, and what a rebalance waits for
+    CommitTimeout   time.Duration // 10s
+    DLQTimeout      time.Duration // 15s per DLQ send
+    Backoff         backoff.Func  // 500ms..30s pause after a failed DLQ send
+    StopOnExhausted bool          // false: exhausted → DLQ; true: Run returns, offset not committed
+    Hooks           RunnerHooks   // test-only: Handled, BeforeCommit (F7)
+}
 ```
 
-M4 splits the implementation in two: `Processor` (dedup, tx, retries, classification), which
-needs only Postgres and is mostly unit-testable, and `Runner` (franz-go poll loop, offset commit
-after the DB commit, DLQ), which only F7 and F8 exercise with Kafka.
+`kafkax.DLQ` produces the dead-letter record with a client built from `ProducerOpts`, so a
+send is bounded by the delivery timeout. `cmd/ledger-consumer` wires it all:
+`KAFKA_DLQ_TOPIC`, `CONSUMER_MAX_ATTEMPTS`, `CONSUMER_STOP_ON_EXHAUSTED`.
 
 ### Error handling
 
 | Error class | Example | Action |
 |---|---|---|
-| Permanent | JSON decode error, unknown `event_version`, invalid currency | Send to DLQ right away |
-| Transient | PG connection reset, serialization failure | In-process retry, exponential backoff, max N |
-| Transient, retries exhausted | PG down for minutes | Send to DLQ (configurable: or stop consuming) |
+| Permanent | JSON decode error, unknown `event_version`, invalid currency, `Permanent(err)`, PG class 22 (data exception) or 23 (constraint violation) except `23505` | Send to DLQ right away |
+| Transient | PG connection reset, `40001` serialization failure, `40P01` deadlock, timeout, `23505` (may be a race), handler panic, bugs such as `42xxx` | In-process retry, exponential backoff, max N |
+| Transient, retries exhausted | PG down for minutes | Send to DLQ (or `StopOnExhausted`: stop consuming) |
 
-DLQ record = original key/value plus headers: `dlq.original_topic`, `dlq.partition`,
-`dlq.offset`, `dlq.error`, `dlq.attempts`, `dlq.failed_at`, and the original `traceparent`.
+Code bugs (a bad SQL statement) are deliberately transient: a bad deploy retries and only
+then dead-letters, instead of skipping every record at once.
+
+DLQ record = original key/value plus the original headers (`event_id`, `traceparent`, …)
+plus: `dlq.original_topic`, `dlq.partition`, `dlq.offset`, `dlq.error` (≤ 1 KiB),
+`dlq.attempts`, `dlq.failed_at`. A record dead-lettered again after a replay gets its
+`dlq.*` headers replaced, not duplicated.
 Optional: `cmd/dlq-replay` re-publishes DLQ messages to the main topic.
 Replay is safe because the consumer is idempotent.
+
+### Offsets
+
+- **Auto-commit is off** (`kgo.DisableAutoCommit`, set by the Runner itself). After a poll's
+  records are handled, the Runner commits them synchronously with `CommitRecords`, i.e.
+  after their DB commit or their DLQ ack.
+- A partition's records are handled strictly in offset order, and a record that is not
+  handled stops its partition for this poll. A Kafka commit is a watermark (committing
+  offset k+1 skips everything before it), so this is what keeps a commit from ever
+  passing an unhandled record.
+- **DLQ send failed → offset not committed.** The partition stops at that record. The
+  Runner commits what came before, rewinds the partition to the record with `SetOffsets`
+  (which also drops the buffered fetches, so later records are not delivered first),
+  pauses for `Backoff(consecutive failures)` and processes the record again. Other
+  partitions keep moving. The record is retried until the DLQ is back; lag alerts on it.
+- A failed offset commit is only logged: the records are already applied, the
+  redelivery is a duplicate the Processor skips.
+- A crash between the DB commit and the offset commit redelivers applied records; F7
+  simulates it with `Hooks.BeforeCommit`.
+
+### Rebalancing
+
+- **`kgo.BlockRebalanceOnPoll`**: from a poll until `AllowRebalance`, the assignment
+  cannot change. Offsets are therefore only committed for partitions this member still
+  owns, and a new owner starts exactly after the last committed record. Without it, a
+  member could commit a partition it already lost and rewind the new owner's commit.
+- The cost of blocking is that a slow batch holds up the whole group (and past the
+  rebalance timeout gets the member kicked out). So **`kgo.OnPartitionsCallbackBlocked`
+  interrupts the in-flight batch**: when a rebalance is waiting, the batch context is
+  cancelled; the record being processed rolls back (or, if its COMMIT already reached the
+  server, is redelivered and skipped as a duplicate); records not handled yet are rewound;
+  handled ones are committed; then the rebalance proceeds. A rebalance waits at most one
+  attempt's rollback, not `MaxPollRecords × MaxAttempts × AttemptTimeout`.
+- **Shutdown** is the same path: on ctx cancel, handled records are committed on a
+  non-cancelled context (bounded by `CommitTimeout`), then the client leaves the group.
+- Partitions of one poll are handled one after another; parallelism comes from more
+  members (≤ partitions).
 
 ---
 
@@ -613,6 +707,22 @@ returning an error. The worker's tx dies on the server side, as it would after a
 - Relay unit-level tests (`FakeProducer`): reschedule with backoff, ordering guard and
   head-of-line blocking, unbuildable rows, idle-timeout check, publish past the idle
   timeout, graceful shutdown and drain timeout (with `NoLeaks`).
+- **F7:** member #1 applies a poll, then `Hooks.BeforeCommit` "crashes" it before the
+  offset commit (nothing committed, DB rows present). Member #2 in the same group gets
+  every record again; the ones #1 applied are skipped as duplicates, so `processed_events`
+  and the ledger hold exactly one row/transaction per event.
+- **F8:** one partition with good, malformed, bad-currency, transient-forever and good
+  records, real `kafkax.DLQ`. Assert three DLQ records with the original key/value/headers
+  and `dlq.*` headers (`dlq.attempts` = 1 for permanent, `MaxAttempts` for exhausted),
+  both good records posted, committed offset at the end of the partition.
+- Consumer tests beyond F7/F8: DLQ down → committed offset stays at the poison record and
+  the next record waits, then both go through once it is back; `StopOnExhausted`;
+  shutdown commits handled records (with `NoLeaks`); members joining and leaving a
+  4-partition group mid-stream (the waiting rebalance interrupts batches) → every event
+  applied exactly once and the group fully committed. Processor tests against Postgres:
+  duplicates, retry with rollback, exhaustion leaves no marker, permanent errors are not
+  retried (including a real `23514`), panic, cancellation, 8 concurrent deliveries of one
+  event, independent consumer names.
 - **F10:** `tracetest.NewInMemoryExporter()` for all three components in-process. Assert one trace ID
   and the parent/child chain.
 - Unit tests (no containers) for `money`, the payment state machine, the backoff policy, and error classification.
@@ -658,7 +768,7 @@ GitHub Actions: `golangci-lint` → unit tests (`-race`) → integration tests
 | **M1 — Foundations** | repo skeleton, `money` + tests, migrations, docker-compose, CI; **event contract** (`internal/event` + golden files); **interfaces** (`outbox.Queue`/`Producer`/`Relay`, `consumer.Handler`/`DLQ`) with fakes; **harness** (`internal/testenv`) + smoke tests; F1–F10 stubs | `make up` works, lint, unit and integration tests green ✅ |
 | **M2 — Walking skeleton** | `POST /payments` → `pgx.Batch` repo → naive relay (no `SKIP LOCKED`, no retries, single instance) → Kafka → consumer that only logs; UUIDv7 ids, RFC 9457 errors, API idempotency (same key + different body → 422) | F1–F3 and the end-to-end test pass ✅ |
 | **M3 — Hardening the write path and the relay** | capture endpoint with `Idempotency-Key` (`Repo.Update` under `FOR UPDATE`); claim/publish/mark in one tx with `SKIP LOCKED` + `NOT EXISTS` ordering guard, per-record backoff, timeout chain checked at start-up, graceful shutdown with drain timeout. Metrics move to M6 (OTel meters) | F1–F4, F6, F9 pass; `TestEndToEnd_PaymentEventsReachConsumer` covers create + capture ✅ |
-| **M4 — Consumer** | ledger double-entry, `processed_events`, retry + DLQ | F7, F8 tests pass |
+| **M4 — Consumer** | ledger double-entry with the balance invariant, `processed_events`; `Processor` (dedup, retries, classification) and `Runner` (auto-commit off, commit after the DB commit, `BlockRebalanceOnPoll` + interrupt on a waiting rebalance, no commit past a failed DLQ send); `kafkax.DLQ`; e2e ends in a ledger transaction | F7, F8 tests pass ✅ |
 | **M5 — Crash scenario** | `Hooks.AfterPublish`, F5 test, `make chaos` | F5 test passes, chaos run leaves ledger balanced |
 | **M6 — Tracing and metrics** | OTel across all three services, Jaeger in compose; relay metrics from §7 | F10 test passes, screenshot in README |
 | **M7 — Polish** | README (diagram, guarantees, failure matrix), ADRs, simple load numbers | A reviewer gets the point in 2 minutes |

@@ -129,6 +129,28 @@ func (k *Kafka) TryConsumeN(t testing.TB, topic string, n int, timeout time.Dura
 	return out
 }
 
+// CommittedOffsets returns the offsets group has committed for topic, by partition.
+// Partitions without a commit are absent.
+func (k *Kafka) CommittedOffsets(t testing.TB, group, topic string) map[int32]int64 {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := k.admin.FetchOffsets(ctx, group)
+	if err == nil {
+		err = resp.Error()
+	}
+	if err != nil {
+		t.Fatalf("testenv: fetch offsets of %s: %v", group, err)
+	}
+	out := map[int32]int64{}
+	for p, o := range resp[topic] {
+		if o.At >= 0 {
+			out[p] = o.At
+		}
+	}
+	return out
+}
+
 // Pause freezes the broker (docker pause). Ports stay mapped and open connections hang,
 // like a network partition. Unlike Stop/Start, the host port does not change, so
 // clients reconnect after Unpause. The container is unpaused on cleanup if still paused.

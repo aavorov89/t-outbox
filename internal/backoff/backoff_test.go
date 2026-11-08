@@ -1,14 +1,14 @@
-package outbox
+package backoff
 
 import (
 	"testing"
 	"time"
 )
 
-func TestExpBackoff(t *testing.T) {
+func TestExp(t *testing.T) {
 	const base, maxDelay = 100 * time.Millisecond, 10 * time.Second
-	lo := ExpBackoff(base, maxDelay, func() float64 { return 0 })
-	hi := ExpBackoff(base, maxDelay, func() float64 { return 0.999999999 })
+	lo := Exp(base, maxDelay, func() float64 { return 0 })
+	hi := Exp(base, maxDelay, func() float64 { return 0.999999999 })
 
 	tests := []struct {
 		attempt int

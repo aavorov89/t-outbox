@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -23,6 +24,7 @@ import (
 	"github.com/aavorov89/t-outbox/internal/event"
 	"github.com/aavorov89/t-outbox/internal/httpapi"
 	"github.com/aavorov89/t-outbox/internal/kafkax"
+	"github.com/aavorov89/t-outbox/internal/ledger"
 	"github.com/aavorov89/t-outbox/internal/outbox"
 	"github.com/aavorov89/t-outbox/internal/payment/postgres"
 	"github.com/aavorov89/t-outbox/internal/testenv"
@@ -40,8 +42,8 @@ type received struct {
 }
 
 // The whole chain: POST /payments and POST /payments/{id}/capture → payment + outbox row
-// in one tx each → relay → Kafka → consumer. All three components run in-process against
-// real Postgres and Kafka.
+// in one tx each → relay → Kafka → ledger consumer → one balanced ledger transaction. All
+// three components run in-process against real Postgres and Kafka.
 func TestEndToEnd_PaymentEventsReachConsumer(t *testing.T) {
 	testenv.NoLeaks(t)
 	log := slog.New(slog.NewTextHandler(t.Output(), nil))
@@ -54,7 +56,7 @@ func TestEndToEnd_PaymentEventsReachConsumer(t *testing.T) {
 
 	// Relay and consumer, stopped (and awaited) before their clients and the pool close.
 	producerCl := env.Kafka.NewClient(t, kafkax.ProducerOpts(env.Kafka.Brokers, 5*time.Second)...)
-	consumerCl := env.Kafka.NewClient(t, kafkax.ConsumerOpts(env.Kafka.Brokers, "ledger-"+topic, topic)...)
+	dlqCl := env.Kafka.NewClient(t, kafkax.ProducerOpts(env.Kafka.Brokers, 5*time.Second)...)
 	relay := outbox.NewRelay(pool, kafkax.NewProducer(producerCl), outbox.Config{
 		Topic:        topic,
 		BatchSize:    10,
@@ -62,16 +64,25 @@ func TestEndToEnd_PaymentEventsReachConsumer(t *testing.T) {
 		Logger:       log.With("service", "relay"),
 	})
 	got := make(chan received, 10)
-	logEvent := consumer.Log(log.With("service", "consumer"))
-	handle := func(ctx context.Context, rec *kgo.Record, e event.Envelope) error {
-		got <- received{rec, e}
-		return logEvent(ctx, rec, e)
-	}
+	consumerLog := log.With("service", "consumer")
+	proc := consumer.NewProcessor(pool, ledger.Handler{}, consumer.ProcessorConfig{
+		Consumer: ledger.ConsumerName,
+		Logger:   consumerLog,
+	})
+	ledgerConsumer := consumer.NewRunner(proc, kafkax.NewDLQ(dlqCl, topic+".dlq"), consumer.RunnerConfig{
+		Logger: consumerLog,
+		Hooks: consumer.RunnerHooks{Handled: func(rec *kgo.Record, _ consumer.Result, err error) {
+			e, decErr := event.Decode(rec.Value)
+			assert.NoError(t, err)
+			assert.NoError(t, decErr)
+			got <- received{rec, e}
+		}},
+	}, kafkax.ConsumerOpts(env.Kafka.Brokers, "ledger-"+topic, topic)...)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Go(func() { assert.NoError(t, relay.Run(ctx)) })
-	wg.Go(func() { assert.NoError(t, consumer.Poll(ctx, consumerCl, handle, log)) })
+	wg.Go(func() { assert.NoError(t, ledgerConsumer.Run(ctx)) })
 	t.Cleanup(func() { cancel(); wg.Wait() })
 
 	// 1. Create a payment.
@@ -166,6 +177,31 @@ func TestEndToEnd_PaymentEventsReachConsumer(t *testing.T) {
 		t.Fatalf("unexpected extra event %s (%s)", extra.env.EventID, extra.env.EventType)
 	case <-time.After(500 * time.Millisecond):
 	}
+
+	// 6. The ledger: both events marked processed, one balanced transaction for the capture.
+	var processed int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM processed_events WHERE consumer = $1`,
+		ledger.ConsumerName).Scan(&processed))
+	require.Equal(t, 2, processed)
+
+	rows, err := pool.Query(ctx, `
+		SELECT transaction_id, event_id, account, amount_minor, currency
+		FROM ledger_entries ORDER BY id`)
+	require.NoError(t, err)
+	type entry struct {
+		TxID, EventID uuid.UUID
+		Account       string
+		Amount        int64
+		Currency      string
+	}
+	entries, err := pgx.CollectRows(rows, pgx.RowToStructByPos[entry])
+	require.NoError(t, err)
+	txID := ledger.TransactionID(c.env.EventID)
+	require.Equal(t, []entry{
+		{txID, c.env.EventID, "psp:receivable", 1999, "EUR"},
+		{txID, c.env.EventID, "merchant:m_42:payable", -1999, "EUR"},
+	}, entries)
+	require.NoError(t, ledger.CheckBalanced(ctx, pool))
 }
 
 // F5: relay #1 publishes, then Hooks.AfterPublish kills its own backend
