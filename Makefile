@@ -6,11 +6,12 @@ GOMODCACHE   := $(shell $(GO) env GOMODCACHE)
 LINT_CACHE   ?= $(HOME)/.cache/golangci-lint-docker
 UIDGID       := $(shell id -u):$(shell id -g)
 
-.PHONY: up down app migrate run-api run-relay run-consumer demo chaos test test-integration lint fmt tidy
+.PHONY: up down app migrate run-api run-relay run-consumer demo chaos load test test-integration lint check-prometheus fmt tidy
 
-## Local stack: postgres + redpanda (+ topics) + jaeger (UI :16686), then migrations.
+## Local stack: postgres + redpanda (+ topics) + jaeger (UI :16686) + prometheus (UI :9090),
+## then migrations.
 up:
-	$(COMPOSE) up -d --wait postgres redpanda jaeger
+	$(COMPOSE) up -d --wait postgres redpanda jaeger prometheus
 	$(COMPOSE) up topics
 	DATABASE_URL='$(DATABASE_URL)' $(GO) run ./cmd/migrate
 
@@ -32,8 +33,11 @@ RUN_ENV := DATABASE_URL='$(DATABASE_URL)' OTEL_EXPORTER_OTLP_ENDPOINT='$(OTEL_EX
 run-api:
 	$(RUN_ENV) $(GO) run ./cmd/payments-api
 
+## Metrics on :9464, scraped by the compose Prometheus. A second relay on the host:
+## make run-relay METRICS_ADDR=:9465
+METRICS_ADDR ?= :9464
 run-relay:
-	$(RUN_ENV) KAFKA_BROKERS='$(KAFKA_BROKERS)' $(GO) run ./cmd/outbox-relay
+	$(RUN_ENV) KAFKA_BROKERS='$(KAFKA_BROKERS)' METRICS_ADDR='$(METRICS_ADDR)' $(GO) run ./cmd/outbox-relay
 
 run-consumer:
 	$(RUN_ENV) KAFKA_BROKERS='$(KAFKA_BROKERS)' $(GO) run ./cmd/ledger-consumer
@@ -48,6 +52,11 @@ demo:
 chaos:
 	COMPOSE='$(COMPOSE)' scripts/chaos.sh
 
+## Load numbers (cmd/loadgen): steady state, then backlog drain with 1 and 2 relays.
+## Starts the app profile itself. LOAD_DURATION, LOAD_CONCURRENCY, LOAD_BACKLOG.
+load:
+	COMPOSE='$(COMPOSE)' scripts/load.sh
+
 ## Unit tests only: no Docker needed.
 test:
 	$(GO) test -race ./...
@@ -55,6 +64,14 @@ test:
 ## Integration tests: testcontainers starts its own Postgres/Redpanda per package.
 test-integration:
 	$(GO) test -tags=integration -race -count=1 -timeout 10m ./...
+
+## Validate the Prometheus config and unit-test the alert rules with promtool (in Docker).
+PROMETHEUS_IMAGE ?= $(shell sed -n 's/^PROMETHEUS_IMAGE=//p' deploy/.env)
+check-prometheus:
+	docker run --rm -v $(CURDIR)/deploy/prometheus:/etc/prometheus:ro -w /etc/prometheus \
+		--entrypoint promtool $(PROMETHEUS_IMAGE) check config prometheus.yml
+	docker run --rm -v $(CURDIR)/deploy/prometheus:/etc/prometheus:ro -w /etc/prometheus \
+		--entrypoint promtool $(PROMETHEUS_IMAGE) test rules alerts_test.yml
 
 ## golangci-lint in Docker, so nothing has to be installed locally. Runs as your uid so
 ## the caches it writes are not root-owned.

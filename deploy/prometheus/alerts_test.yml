@@ -1,0 +1,63 @@
+# promtool test rules alerts_test.yml (make check-prometheus)
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Two relays report the same table: max(), so the value is the age, not twice it.
+  # 30s of lag is healthy; at 90s the alert is pending and fires after `for: 2m`.
+  - interval: 1m
+    input_series:
+      - series: 'outbox_oldest_pending_age_seconds{instance="relay-1:9464"}'
+        values: '30 90 150 210 270'
+      - series: 'outbox_oldest_pending_age_seconds{instance="relay-2:9464"}'
+        values: '30 90 150 210 270'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: OutboxBacklogStale
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: OutboxBacklogStale
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: OutboxBacklogStale
+        exp_alerts:
+          - exp_labels: {severity: page}
+            exp_annotations:
+              summary: "Oldest unpublished outbox event is 3m 30s old"
+              description: "Check outbox.last_error of the oldest pending rows, and the relays' logs."
+
+  # Every relay gone (or the database): the gauge disappears, and that alerts too.
+  - interval: 1m
+    input_series:
+      - series: 'outbox_oldest_pending_age_seconds{instance="relay-1:9464"}'
+        values: '0 0 _ _ _ _ _ _ _ _ _'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: OutboxBacklogUnknown
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: OutboxBacklogUnknown
+        exp_alerts:
+          - exp_labels: {severity: page}
+            exp_annotations:
+              summary: "No relay reports the outbox backlog (relays down or database unreachable)"
+
+  # One unbuildable row is enough for a ticket.
+  - interval: 1m
+    input_series:
+      - series: 'outbox_publish_failures_total{error_type="build",instance="relay-1:9464",messaging_destination_name="payments.events"}'
+        values: '0 1 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: OutboxUnbuildableRow
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              error_type: build
+              instance: "relay-1:9464"
+              messaging_destination_name: payments.events
+            exp_annotations:
+              summary: "An outbox row fails envelope validation and blocks its aggregate"
+              description: "SELECT id, aggregate_id, last_error FROM outbox WHERE published_at IS NULL AND attempts > 0"

@@ -4,7 +4,8 @@
 //	DATABASE_URL=postgres://... KAFKA_BROKERS=localhost:19092 go run ./cmd/outbox-relay
 //
 // Optional: KAFKA_TOPIC (payments.events), RELAY_BATCH_SIZE (100),
-// RELAY_POLL_INTERVAL (200ms). SIGTERM/SIGINT finish the in-flight batch, then exit.
+// RELAY_POLL_INTERVAL (200ms), METRICS_ADDR (:9464, Prometheus /metrics). SIGTERM/SIGINT
+// finish the in-flight batch, then exit.
 package main
 
 import (
@@ -48,6 +49,11 @@ func run() error {
 			log.Warn("telemetry shutdown", "err", err)
 		}
 	}()
+	metrics, shutdownMetrics, err := telemetry.SetupMetrics(ctx, "outbox-relay")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = shutdownMetrics(context.Background()) }() // pull exporter: nothing to flush
 
 	cfg := outbox.DefaultConfig(getenv("KAFKA_TOPIC", "payments.events"))
 	cfg.Logger = log
@@ -77,6 +83,19 @@ func run() error {
 	}
 	defer pool.Close()
 
+	// Backlog gauges, read from the table per scrape: every relay reports the same values.
+	unobserve, err := outbox.ObserveBacklog(pool, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unobserve() }()
+	metricsAddr := getenv("METRICS_ADDR", ":9464")
+	stopMetrics, err := telemetry.ServeMetrics(metricsAddr, metrics, log)
+	if err != nil {
+		return err
+	}
+	defer stopMetrics()
+
 	brokers := strings.Split(getenv("KAFKA_BROKERS", "localhost:19092"), ",")
 	cl, err := kgo.NewClient(kafkax.ProducerOpts(brokers, kafkax.DefaultDeliveryTimeout)...)
 	if err != nil {
@@ -86,7 +105,8 @@ func run() error {
 
 	log.Info("relaying", "topic", cfg.Topic, "brokers", brokers,
 		"batch_size", cfg.BatchSize, "poll_interval", cfg.PollInterval.String(),
-		"publish_timeout", cfg.PublishTimeout.String(), "drain_timeout", cfg.DrainTimeout.String())
+		"publish_timeout", cfg.PublishTimeout.String(), "drain_timeout", cfg.DrainTimeout.String(),
+		"metrics_addr", metricsAddr)
 	err = outbox.NewRelay(pool, kafkax.NewProducer(cl), cfg).Run(ctx)
 	log.Info("stopped")
 	return err

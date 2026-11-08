@@ -11,6 +11,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
 // Timeouts of the relay, from inner to outer. Each must be larger than the previous one:
@@ -27,14 +30,23 @@ const (
 	IdleInTransactionTimeout = 30 * time.Second
 )
 
+// StatementTimeout bounds every statement of a relay session (claim, mark, reschedule;
+// each takes milliseconds). idle_in_transaction_session_timeout does not cover a
+// statement that is running, so without it a pathological claim would hold its row
+// locks for as long as it runs. When it fires, the cycle rolls back and Run retries
+// with backoff, with a fresh plan.
+const StatementTimeout = 5 * time.Second
+
 // maxLastErrorLen bounds outbox.last_error.
 const maxLastErrorLen = 1024
 
-// ConfigurePool sets the session parameters a relay's pool needs. Pass it to
+// ConfigurePool sets the session parameters a relay's pool needs
+// (idle_in_transaction_session_timeout, statement_timeout, application_name). Pass it to
 // pgxpool.ParseConfig's result (or testenv.NewPool).
 func ConfigurePool(c *pgxpool.Config) {
 	rp := c.ConnConfig.RuntimeParams
 	rp["idle_in_transaction_session_timeout"] = strconv.FormatInt(IdleInTransactionTimeout.Milliseconds(), 10)
+	rp["statement_timeout"] = strconv.FormatInt(StatementTimeout.Milliseconds(), 10)
 	if rp["application_name"] == "" {
 		rp["application_name"] = "outbox-relay"
 	}
@@ -75,8 +87,11 @@ type Config struct {
 	// Backoff is the delay before re-trying a failed row, by attempt number. Run also uses
 	// it between consecutive failed cycles (e.g. database down).
 	Backoff Backoff
-	Hooks   Hooks
-	Logger  *slog.Logger
+	// MeterProvider gets the relay's instruments (metrics.go). nil: the global provider,
+	// a no-op until telemetry.SetupMetrics runs.
+	MeterProvider metric.MeterProvider
+	Hooks         Hooks
+	Logger        *slog.Logger
 }
 
 // DefaultConfig returns production defaults for topic.
@@ -107,7 +122,7 @@ func DefaultConfig(topic string) Config {
 // rows with the rollback and another relay re-publishes them: delivery is at-least-once,
 // and the consumer dedups by event_id.
 //
-// Ordering: a row is claimable only if no earlier row of the same aggregate is still
+// Ordering: a row is claimable only if the previous version of its aggregate is not
 // unpublished, so the next event of an aggregate is published only after the previous
 // one is committed as published. A failing event blocks its aggregate (and only it) until
 // it goes through.
@@ -115,6 +130,7 @@ type Relay struct {
 	pool     *pgxpool.Pool
 	producer Producer
 	cfg      Config
+	metrics  *relayMetrics
 }
 
 func NewRelay(pool *pgxpool.Pool, p Producer, cfg Config) *Relay {
@@ -137,7 +153,15 @@ func NewRelay(pool *pgxpool.Pool, p Producer, cfg Config) *Relay {
 	if cfg.Logger == nil {
 		cfg.Logger = def.Logger
 	}
-	return &Relay{pool: pool, producer: p, cfg: cfg}
+	if cfg.MeterProvider == nil {
+		cfg.MeterProvider = otel.GetMeterProvider()
+	}
+	m, err := newRelayMetrics(cfg.MeterProvider, cfg.Topic)
+	if err != nil { // only for invalid instrument names, i.e. a bug here: don't fail the relay for it
+		cfg.Logger.Error("outbox relay: metrics disabled", "err", err)
+		m, _ = newRelayMetrics(noop.NewMeterProvider(), cfg.Topic)
+	}
+	return &Relay{pool: pool, producer: p, cfg: cfg, metrics: m}
 }
 
 // PublishError reports the records of a cycle that were not published. They were
@@ -253,19 +277,38 @@ func (r *Relay) checkIdleTimeout(ctx context.Context) error {
 }
 
 // claimSQL takes the oldest claimable rows. A row is claimable if it is pending, due, and
-// no earlier row of its aggregate is still unpublished (pending, backing off, or locked by
-// another relay). SKIP LOCKED makes concurrent relays take disjoint rows without waiting.
+// the previous event of its aggregate (version - 1) is not unpublished: it is published,
+// or there is none (version 1, or deleted after it was published). SKIP LOCKED makes
+// concurrent relays take disjoint rows without waiting.
+//
+// Why "previous version is published" is the whole ordering guard: v becomes claimable
+// only once v-1 is published, which needed v-2 to be published, and so on, so an
+// aggregate's events are published one at a time in version order. Versions are
+// contiguous (UNIQUE (aggregate_type, aggregate_id, aggregate_version) plus the +1 check
+// of Repo.Update), and the writer invariant guarantees that v-1 is committed, hence
+// visible, before v is.
+//
+// The shape of the guard is chosen for the planner, not for style. The probe is an
+// equality lookup on that unique key and says nothing about published_at in its WHERE,
+// so its only sensible plan is one unique-index probe per candidate row. The obvious
+// form, NOT EXISTS (... p.published_at IS NULL AND p.id < o.id), matches the partial
+// index outbox_pending too, and on a queue table that index is empty whenever
+// autovacuum looks at it (reltuples = 0): the planner then believes a full scan of it is
+// free and runs one per candidate row. With a sudden backlog (broker outage, relays
+// down) that made each claim O(backlog^2): 435ms at 20,000 pending rows, and minutes for
+// a claim whose snapshot predates a drain, with its locked rows stuck behind it.
+// TestRelay_ClaimCostWithStaleStats pins the plan.
 const claimSQL = `
 SELECT o.id, o.event_id, o.aggregate_type, o.aggregate_id, o.aggregate_version,
        o.event_type, o.event_version, o.occurred_at, o.payload, o.headers, o.attempts
 FROM outbox o
 WHERE o.published_at IS NULL
   AND o.next_attempt_at <= now()
-  AND NOT EXISTS (
-        SELECT 1 FROM outbox p
-        WHERE p.aggregate_id = o.aggregate_id
-          AND p.published_at IS NULL
-          AND p.id < o.id)
+  AND (SELECT p.published_at IS NOT NULL
+       FROM outbox p
+       WHERE p.aggregate_type    = o.aggregate_type
+         AND p.aggregate_id      = o.aggregate_id
+         AND p.aggregate_version = o.aggregate_version - 1) IS NOT FALSE
 ORDER BY o.id
 LIMIT $1
 FOR UPDATE SKIP LOCKED`
@@ -289,6 +332,15 @@ WHERE o.id = f.id`
 //
 // Unlike Run, RunOnce stops as soon as ctx is cancelled: the tx rolls back.
 func (r *Relay) RunOnce(ctx context.Context) (int, error) {
+	n, err := r.runOnce(ctx)
+	var pubErr *PublishError
+	if err != nil && !errors.As(err, &pubErr) {
+		r.metrics.cycleFailures.Add(ctx, 1, r.metrics.topic)
+	}
+	return n, err
+}
+
+func (r *Relay) runOnce(ctx context.Context) (int, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("outbox: begin: %w", err)
@@ -326,7 +378,9 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 	if len(recs) > 0 {
 		spans := startSendSpans(rows, recs, idx)
 		pubCtx, cancel := context.WithTimeout(ctx, r.cfg.PublishTimeout)
+		start := time.Now()
 		perRec := r.producer.Produce(pubCtx, recs)
+		r.metrics.duration.Record(ctx, time.Since(start).Seconds(), r.metrics.topic)
 		cancel()
 		for j, err := range perRec {
 			errs[idx[j]] = err
@@ -372,6 +426,8 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 	if err := tx.Commit(ctx); err != nil {
 		return len(rows), fmt.Errorf("outbox: commit: %w", err)
 	}
+	buildFailed := len(rows) - len(recs)
+	r.metrics.cycle(ctx, len(ok), buildFailed, len(failed)-buildFailed)
 	if len(failed) > 0 {
 		return len(rows), &PublishError{Failed: len(failed), Total: len(rows), Err: errors.Join(failed...)}
 	}

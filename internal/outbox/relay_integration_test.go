@@ -4,6 +4,7 @@ package outbox_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -232,6 +233,20 @@ func TestRelay_RefusesIdleTimeoutBelowPublishTimeout(t *testing.T) {
 	relay := outbox.NewRelay(pool, &outboxtest.FakeProducer{}, outbox.Config{Topic: "t", PublishTimeout: 2 * time.Second})
 	err := relay.Run(context.Background())
 	require.ErrorContains(t, err, "must be greater than PublishTimeout")
+}
+
+// ConfigurePool bounds every statement of a relay session: idle_in_transaction does not
+// cover a claim that is running, and a running claim holds its row locks.
+func TestConfigurePool_SessionTimeouts(t *testing.T) {
+	t.Parallel()
+	pool := relayPool(t)
+	var stmt, idle, app string
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`SELECT current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout'),
+		        current_setting('application_name')`).Scan(&stmt, &idle, &app))
+	require.Equal(t, "5s", stmt)
+	require.Equal(t, "30s", idle)
+	require.Equal(t, "outbox-relay", app)
 }
 
 // Why the timeouts must be ordered: a publish that outlives the server's idle timeout
@@ -532,7 +547,7 @@ func (p flakyProducer) Produce(ctx context.Context, recs []outbox.Record) []erro
 
 // F9: 20 aggregates × 10 events, written while 4 relays run, with 30% of publishes failing
 // at random. In Kafka every aggregate's events sit in one partition, in version order,
-// each exactly once. Without the NOT EXISTS guard a relay would publish v+1 while v is
+// each exactly once. Without the ordering guard a relay would publish v+1 while v is
 // backing off after a failure.
 func TestRelay_PerAggregateOrdering(t *testing.T) {
 	t.Parallel()
@@ -603,4 +618,55 @@ func TestRelay_PerAggregateOrdering(t *testing.T) {
 		}
 		require.Equal(t, want, got, "%s: versions in partition order", key)
 	}
+}
+
+// ---- claim cost ----
+
+// The claim's cost must not depend on the size of the backlog, even when the planner's
+// statistics say the queue is empty. That is the normal state of a healthy queue table:
+// whenever autovacuum looks, the partial index outbox_pending is empty and its reltuples
+// is 0. Then a backlog appears at once (here 10,000 rows; in production a broker outage).
+//
+// A guard of the form NOT EXISTS (... p.published_at IS NULL AND p.id < o.id) is then
+// planned as a full scan of outbox_pending per candidate row, which the planner believes
+// is free: 60k+ buffers for one claim of 100 here, quadratic in the backlog. The claim
+// must stay one unique-index probe per candidate: a few buffers per row.
+func TestRelay_ClaimCostWithStaleStats(t *testing.T) {
+	t.Parallel()
+	pool := relayPool(t)
+	ctx := context.Background()
+
+	// 5,000 aggregates × 2 versions, in the id order the API writes them (v1 then v2 of
+	// one payment), all published: the partial index is empty when VACUUM measures it.
+	_, err := pool.Exec(ctx, `
+		INSERT INTO outbox (event_id, aggregate_type, aggregate_id, aggregate_version, event_type,
+		                    event_version, occurred_at, payload, published_at)
+		SELECT gen_random_uuid(), 'payment', 'agg-' || i, v, 'payment.created', 1, now(), '{}', now()
+		FROM generate_series(1, 5000) i, generate_series(1, 2) v
+		ORDER BY i, v`)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `VACUUM ANALYZE outbox`)
+	require.NoError(t, err)
+	var reltuples float64
+	require.NoError(t, pool.QueryRow(ctx, `SELECT reltuples FROM pg_class WHERE relname = 'outbox_pending'`).Scan(&reltuples))
+	require.Zero(t, reltuples, "precondition: the planner believes the queue is empty")
+
+	_, err = pool.Exec(ctx, `UPDATE outbox SET published_at = NULL`) // the sudden backlog
+	require.NoError(t, err)
+
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback(ctx) }()
+	var plan []struct {
+		Plan struct {
+			ActualRows      float64 `json:"Actual Rows"`
+			SharedHitBlocks int     `json:"Shared Hit Blocks"`
+		}
+	}
+	var raw []byte
+	require.NoError(t, tx.QueryRow(ctx, `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) `+outbox.ClaimSQL, 100).Scan(&raw))
+	require.NoError(t, json.Unmarshal(raw, &plan))
+	require.Equal(t, 100.0, plan[0].Plan.ActualRows, "100 heads claimed (every v1), the v2 rows wait")
+	require.Less(t, plan[0].Plan.SharedHitBlocks, 3000,
+		"one claim of 100 must touch a few buffers per candidate row, not scan the backlog per row; plan:\n%s", raw)
 }

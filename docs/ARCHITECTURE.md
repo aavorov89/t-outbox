@@ -17,7 +17,7 @@ gives **effectively-once processing**. The system never claims "exactly-once del
 | N relay workers using `FOR UPDATE SKIP LOCKED` | Debezium/CDC (covered in an ADR as the alternative) |
 | Per-aggregate ordering | Schema registry, Avro/Protobuf (JSON is enough here) |
 | Idempotent ledger consumer + DLQ | Real PSP integration |
-| OpenTelemetry trace across HTTP → DB → Kafka → consumer | |
+| OpenTelemetry trace across HTTP → DB → Kafka → consumer; relay metrics in Prometheus | |
 | Integration tests with testcontainers-go, including crash scenarios | |
 | Money as `int64` minor units + ISO 4217 currency | |
 
@@ -40,6 +40,8 @@ flowchart LR
     R1 -. OTLP .-> J
     R2 -. OTLP .-> J
     L -. OTLP .-> J
+    P[Prometheus] -. scrape /metrics .-> R1
+    P -. scrape /metrics .-> R2
 ```
 
 | Binary | Responsibility | Scales by |
@@ -60,7 +62,8 @@ binary so you can scale it on its own and kill it in tests.
 ├── cmd/
 │   ├── payments-api/
 │   ├── outbox-relay/
-│   └── ledger-consumer/
+│   ├── ledger-consumer/
+│   └── loadgen/          # load generator + pipeline lag report (make load)
 ├── internal/
 │   ├── money/            # Money, Currency (ISO 4217 + exponent), safe arithmetic
 │   ├── payment/          # domain: aggregate, state machine, events
@@ -73,7 +76,7 @@ binary so you can scale it on its own and kill it in tests.
 │   │   └── consumertest/ # FakeDLQ
 │   ├── backoff/          # capped exponential backoff with jitter (relay and consumer)
 │   ├── kafkax/           # outbox.Producer and consumer.DLQ over franz-go
-│   ├── telemetry/        # OTel setup (tracer provider, OTLP exporter, propagator), Kafka header carrier, slog trace IDs
+│   ├── telemetry/        # OTel setup: traces (OTLP → Jaeger), metrics (Prometheus exporter, /metrics), propagator, Kafka header carrier, slog trace IDs
 │   ├── httpapi/          # handlers, RFC 9457 problems, middleware (otelhttp, recovery, logging)
 │   └── testenv/          # testcontainers harness (build tag: integration)
 ├── cmd/migrate/          # applies embedded migrations (used by `make up`)
@@ -82,18 +85,19 @@ binary so you can scale it on its own and kill it in tests.
 ├── deploy/
 │   ├── .env              # image versions: single source for compose AND testcontainers
 │   ├── Dockerfile        # one image with all binaries
-│   └── docker-compose.yml  # postgres, redpanda (+ topic init), jaeger; profile `app`: api, 2 relays, consumer
-├── scripts/              # demo.sh, chaos.sh (make demo, make chaos)
+│   ├── docker-compose.yml  # postgres, redpanda (+ topic init), jaeger, prometheus; profile `app`: api, 2 relays, consumer
+│   └── prometheus/       # scrape config, alert rules + promtool tests (make check-prometheus)
+├── scripts/              # demo.sh, chaos.sh, load.sh (make demo, make chaos, make load)
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── api-errors.md     # problem types, idempotency semantics
-│   └── adr/
+│   └── adr/              # 0001–0006, see §13
 ├── Makefile
 └── .github/workflows/ci.yml
 ```
 
 **Stack:** Go (latest stable), `jackc/pgx/v5`, `twmb/franz-go`, `pressly/goose`,
-`net/http` (Go 1.22+ routing), `log/slog`, OpenTelemetry Go SDK,
+`net/http` (Go 1.22+ routing), `log/slog`, OpenTelemetry Go SDK (traces → Jaeger, metrics → Prometheus),
 `testcontainers-go` (postgres + redpanda modules), `golangci-lint` (run in Docker).
 
 Integration tests of one component live next to it (`*_integration_test.go`,
@@ -175,8 +179,9 @@ CREATE TABLE outbox (
     published_at      TIMESTAMPTZ,
     UNIQUE (aggregate_type, aggregate_id, aggregate_version)
 );
-CREATE INDEX outbox_pending      ON outbox (id)                WHERE published_at IS NULL;
-CREATE INDEX outbox_pending_aggr ON outbox (aggregate_id, id)  WHERE published_at IS NULL;
+CREATE INDEX outbox_pending ON outbox (id) WHERE published_at IS NULL;
+-- the ordering guard probes UNIQUE (aggregate_type, aggregate_id, aggregate_version);
+-- outbox_pending_aggr (aggregate_id, id) of 00001 was dropped in 00003 (§7, ADR 0004)
 
 -- consumer side
 CREATE TABLE processed_events (
@@ -201,7 +206,8 @@ CREATE TABLE ledger_entries (
 a database guarantee and catches concurrent writers to one aggregate.
 
 The full schema (with `CHECK`s on `payments` and `ledger_entries`) is in
-`migrations/00001_init.sql` and `00002_capture_idempotency_key.sql`.
+`migrations/00001_init.sql`, `00002_capture_idempotency_key.sql` and
+`00003_drop_outbox_pending_aggr.sql`.
 
 Cleanup: a periodic `DELETE FROM outbox WHERE published_at < now() - interval '7 days'`
 in batches. The ADR notes partitioning by `created_at` as the high-volume option.
@@ -263,8 +269,9 @@ to mock it, and it is tested against real Postgres.
   while the write transaction's span is active, so the trace survives the async gap (§9).
   Without `telemetry.Setup` (unit tests) the global propagator is a no-op and headers stay `{}`.
 - **Writer invariant:** events of one aggregate are queued while holding a lock on it
-  (`FOR UPDATE` on the payment, or the payment row not being committed yet). Otherwise
-  `outbox.id` order can differ from commit order and the ordering guard in §7 breaks.
+  (`FOR UPDATE` on the payment, or the payment row not being committed yet). So version
+  v-1 is committed, and visible to a relay, before v exists, which the ordering guard
+  in §7 relies on.
 - **API idempotency:** a unique violation on `idempotency_key` returns the existing payment
   with `200` instead of `201`. Client retries never create a second payment or a second event.
   The same key with a different request gets `422` (not `409`: no "still in progress" state
@@ -293,11 +300,11 @@ SELECT o.id, o.event_id, o.aggregate_type, o.aggregate_id, o.aggregate_version,
 FROM outbox o
 WHERE o.published_at IS NULL
   AND o.next_attempt_at <= now()
-  AND NOT EXISTS (                       -- an earlier event for the same aggregate
-        SELECT 1 FROM outbox p           -- is still unpublished (pending or in flight)
-        WHERE p.aggregate_id = o.aggregate_id
-          AND p.published_at IS NULL
-          AND p.id < o.id)
+  AND (SELECT p.published_at IS NOT NULL     -- the previous version of the aggregate
+       FROM outbox p                         -- is published, or there is none
+       WHERE p.aggregate_type    = o.aggregate_type
+         AND p.aggregate_id      = o.aggregate_id
+         AND p.aggregate_version = o.aggregate_version - 1) IS NOT FALSE
 ORDER BY o.id
 LIMIT $1
 FOR UPDATE SKIP LOCKED;
@@ -305,9 +312,26 @@ FOR UPDATE SKIP LOCKED;
 
 `SKIP LOCKED` lets N workers share the table without blocking each other. On its own
 it breaks ordering: worker B can publish `captured` while worker A is still
-publishing `created`. The `NOT EXISTS` guard fixes that. The next event for an
-aggregate becomes visible only after the previous one is **committed as published**.
-Different aggregates are still processed in parallel.
+publishing `created`. The guard fixes that. The next event for an aggregate becomes
+visible only after the previous one is **committed as published**. Different aggregates
+are still processed in parallel.
+
+- **Why the previous version is enough:** v becomes claimable only once v-1 is published,
+  which needed v-2 to be published, and so on, so an aggregate's events are published one
+  at a time in version order. Versions are contiguous (the `UNIQUE` key plus the +1 check
+  of `Repo.Update`), and the writer invariant (§6) makes v-1 visible before v. A missing
+  predecessor (v1, or a published row deleted by the cleanup) does not block: a capture
+  can come days after its payment's `created` event was cleaned up.
+- **Why this form, and not `NOT EXISTS (... p.published_at IS NULL AND p.id < o.id)`:**
+  found by `make load` in M7 ([ADR 0004](adr/0004-per-aggregate-ordering-guard.md)). A
+  healthy queue's partial index `outbox_pending` is empty whenever autovacuum measures it
+  (`reltuples = 0`), so the planner believes a full scan of it is free and planned the
+  `NOT EXISTS` as one such scan per candidate row. A sudden backlog made every claim
+  O(backlog²): 435ms and 2M filtered rows per claim at 20,000 pending rows; one claim ran
+  for more than 6 minutes, holding locks on 39 rows. The probe above has no
+  `published_at` predicate in its `WHERE`, so the partial index does not match it, and
+  the only plan is one unique-index lookup: about 1ms for the same claim.
+  `TestRelay_ClaimCostWithStaleStats` builds that state on purpose (§11).
 
 ### Loop (one worker)
 
@@ -345,6 +369,9 @@ Design choices:
   directly to `ok_ids` / `failed_ids`. Records are built with
   `key=aggregate_id`, so per-aggregate order is also kept inside the Kafka partition.
 - Optional: `LISTEN/NOTIFY` wake-up to cut latency below `pollInterval`.
+- **Every statement is bounded too**: `statement_timeout` = 5s on relay sessions
+  (`outbox.ConfigurePool`). The idle timeout below does not cover a statement that is
+  running, and a running claim holds its row locks.
 
 ### Batch size and poll interval
 
@@ -369,6 +396,7 @@ transaction. The timeouts are therefore chained, inner to outer:
 | franz-go delivery timeout | 10s | one record (enforced, see below) | `kafkax.DefaultDeliveryTimeout` |
 | `Config.PublishTimeout` | 15s | one `Produce` call, any `Producer` | ctx deadline in `RunOnce` |
 | `idle_in_transaction_session_timeout` | 30s | a relay that froze mid-batch (GC, SIGSTOP, partition) | `outbox.ConfigurePool` (`RuntimeParams`) |
+| `statement_timeout` | 5s | one statement of a relay session (claim, mark); orthogonal to the chain | `outbox.ConfigurePool` (`RuntimeParams`) |
 
 If the server timeout fired before a healthy but slow publish ended, the server would kill
 the session after the records landed: the mark is lost and every slow batch is published
@@ -410,7 +438,8 @@ steps.
 func NewRelay(pool *pgxpool.Pool, p Producer, cfg Config) *Relay
 func (r *Relay) Run(ctx context.Context) error            // loops until ctx is cancelled, drains, returns nil
 func (r *Relay) RunOnce(ctx context.Context) (int, error) // one claim/publish/mark cycle; tests step with it
-func ConfigurePool(c *pgxpool.Config)                     // idle_in_transaction_session_timeout, application_name
+func ConfigurePool(c *pgxpool.Config)                     // idle_in_transaction_session_timeout, statement_timeout, application_name
+func ObserveBacklog(pool *pgxpool.Pool, mp metric.MeterProvider) (unregister func() error, err error) // backlog gauges
 
 type Config struct {
     Topic          string        // tests use a unique topic each
@@ -419,17 +448,56 @@ type Config struct {
     PublishTimeout time.Duration // 15s; must be < idle_in_transaction_session_timeout
     DrainTimeout   time.Duration // 20s; how long a shutdown waits for the in-flight batch
     Backoff        Backoff       // func(attempt int) time.Duration; ExpBackoff = capped exp + equal jitter
+    MeterProvider  metric.MeterProvider // nil: global (telemetry.SetupMetrics); tests pass their own
     Hooks          Hooks         // test-only seams, nil in production
 }
 ```
 
-### Metrics (M7)
-Not in M6: the services export OTLP straight to Jaeger, which takes traces only, so metrics
-need a backend of their own (Prometheus). Planned:
-`outbox_pending_total`, `outbox_oldest_pending_age_seconds` (the main SLO signal),
-`outbox_publish_duration_seconds`, `outbox_publish_failures_total`.
+### Metrics
 
----
+The relay records with the OTel metric API (like tracing, only the global API in the
+instrumented code, or `Config.MeterProvider`), and `telemetry.SetupMetrics` exports
+them with the OTel Prometheus exporter: `outbox-relay` serves `/metrics` on
+`METRICS_ADDR` (`:9464`). It is pull, because Jaeger takes traces only.
+
+| Prometheus name | Type | Labels | Meaning |
+|---|---|---|---|
+| `outbox_oldest_pending_age_seconds` | gauge | | `now() - created_at` of the oldest unpublished row, 0 when none. **The SLO signal** |
+| `outbox_pending` | gauge | | unpublished rows, due or backing off |
+| `outbox_published_total` | counter | `messaging_destination_name` | rows published and marked (after `COMMIT`) |
+| `outbox_publish_failures_total` | counter | `…`, `error_type` = `publish` \| `build` | rows rescheduled: producer error, or row not buildable |
+| `outbox_publish_duration_seconds` | histogram | `…` | one `Produce` call (a batch); buckets up to `PublishTimeout` |
+| `outbox_cycle_failures_total` | counter | `…` | cycles that rolled back (DB down, statement timeout, …) |
+
+- **The backlog gauges describe the table, not a relay.** `ObserveBacklog` reads them with
+  one query per scrape (`count(*)` and `min(created_at)` over the pending rows, the
+  database's clock, 2s timeout). Every relay reports the same values, so aggregate with
+  `max()`, never `sum()`. If the query fails, the scrape has no sample for them, which has
+  its own alert.
+- **Why age, not count, is the SLO:** the count scales with the write rate and is large
+  in a healthy burst; the age grows only when publishing is stuck. It catches relays
+  down, Kafka down, and one aggregate stuck behind a failing event (head-of-line), the
+  last of which a count would hide.
+- `outbox_pending_total` in the original plan became `outbox_pending`: in Prometheus,
+  `_total` marks a counter, and `rate()` over a gauge with that name would mislead.
+- Counters are added after `COMMIT` only: a cycle that rolled back published nothing as
+  far as the table is concerned, even if Kafka got the records (F5).
+- **Alerts** (`deploy/prometheus/alerts.yml`, unit-tested with `promtool test rules`):
+
+  | Alert | Expression (abridged) | Severity |
+  |---|---|---|
+  | `OutboxBacklogStale` | `max(outbox_oldest_pending_age_seconds) > 60` for 2m | page |
+  | `OutboxBacklogUnknown` | `absent(outbox_oldest_pending_age_seconds)` for 5m | page |
+  | `OutboxPublishFailing` | `rate(outbox_publish_failures_total{error_type="publish"}[5m]) > 0` for 10m | ticket |
+  | `OutboxUnbuildableRow` | `increase(…{error_type="build"}[15m]) > 0` (it never heals itself) | ticket |
+  | `OutboxRelayCyclesFailing` | `rate(outbox_cycle_failures_total[5m]) > 0` for 5m | ticket |
+
+- Local: `make up` starts Prometheus (UI on http://localhost:9090); it scrapes `relay-1`,
+  `relay-2` (`make app`) and relays on the host (`make run-relay`, `:9464`/`:9465`).
+  No Alertmanager: alerts are evaluated and shown at `/alerts`, not routed.
+- Not instrumented (yet): the consumer (lag is visible as Kafka group lag) and the API
+  (otelhttp would record `http.server.request.duration` as soon as it got a meter
+  provider).
 
 ## 8. Consumer: idempotency + DLQ
 
@@ -652,8 +720,9 @@ This is the core of the README: each row maps to an integration test.
 | F6 | Kafka unavailable | Rows stay pending, `attempts` grows, published after recovery | Backoff, durable outbox | `TestRelay_BrokerOutage` |
 | F7 | Consumer dies after DB commit, before offset commit | Redelivery | `processed_events` | `TestConsumer_RedeliveryIsIdempotent` |
 | F8 | Poison message | Goes to DLQ, partition keeps moving | Error classification | `TestConsumer_PoisonGoesToDLQ` |
-| F9 | Events for one aggregate across N relays | Published in `aggregate_version` order | `NOT EXISTS` guard + key partitioning | `TestRelay_PerAggregateOrdering` |
+| F9 | Events for one aggregate across N relays | Published in `aggregate_version` order | Ordering guard in the claim + key partitioning | `TestRelay_PerAggregateOrdering` |
 | F10 | Trace across async boundary | Consumer span shares the API span's trace ID | Header propagation | `TestTracing_EndToEnd` |
+| F11 | Sudden backlog while the planner's statistics say the queue is empty | Claims stay O(batch); the backlog drains at full speed | Guard is a unique-key probe (§7); `statement_timeout` bounds any claim | `TestRelay_ClaimCostWithStaleStats` |
 
 ---
 
@@ -789,6 +858,18 @@ worker's tx dies on the server side, as it would after a `kill -9` of the proces
   the baggage; every span is in the caller's trace; for each event the chain server → tx →
   producer → consumer → apply (→ `ledger.post`) with the right kinds and remote parents at
   both hand-offs; messaging attributes; no stray spans (idle relay cycles create none).
+- **F11** (`TestRelay_ClaimCostWithStaleStats`): 5,000 aggregates × 2 versions written as
+  published, `VACUUM ANALYZE` (asserts `reltuples = 0` for `outbox_pending`), then all
+  10,000 rows unpublished at once. `EXPLAIN (ANALYZE, BUFFERS)` of one claim of 100 must
+  touch fewer than 3,000 buffers; the old `NOT EXISTS` guard touches 22,600 (1M rows
+  removed by its join filter), the current one about 1,000.
+- **Metrics** (`TestRelay_Metrics`): the relay and `ObserveBacklog` on a meter provider
+  from `telemetry.NewMetrics`, scraped through its Prometheus handler, so the test sees
+  the exported names: published / failed-by-cause / duration count per cycle, cycle
+  failures on a rolled-back cycle, the backlog gauges before and after (an hour-old row
+  gives an age of 3,600s). `TestObserveBacklog_DatabaseDown`: no backlog samples, no
+  hanging scrape. Alert rules: `make check-prometheus` (`promtool test rules`: `max()`
+  over two relays, absence, an unbuildable row).
 - Unit tests (no containers) for `money`, the payment state machine, the backoff policy, and error classification.
 - `make test` runs unit tests only (no Docker). `make test-integration` runs
   `go test -tags=integration -race ./...`; it starts its own containers and does not need `make up`.
@@ -798,11 +879,13 @@ worker's tx dies on the server side, as it would after a `kill -9` of the proces
 ## 12. Local run and CI
 
 ```
-make up        # docker compose: postgres, redpanda + topics, jaeger (UI :16686), migrations
+make up        # docker compose: postgres, redpanda + topics, jaeger (UI :16686), prometheus (UI :9090), migrations
 make app       # profile `app`: api (:8080), relay-1, relay-2, ledger-consumer from deploy/Dockerfile
 make lint      # golangci-lint in Docker, as your uid
 make demo      # curl script: create + capture 100 payments, wait for the consumer, print the ledger
 make chaos     # SIGKILLs relay containers in a loop under load; fails unless the ledger is exact
+make load      # cmd/loadgen: API capacity, steady-state lag, backlog drain with 1 and 2 relays
+make check-prometheus  # promtool: config + alert rule unit tests
 ```
 
 `make chaos` (`scripts/chaos.sh`) starts the `app` profile, waits until earlier events are
@@ -820,24 +903,37 @@ run on a dev laptop got 10 kills and 57 re-published events, all skipped by the 
 `CHAOS_PAYMENTS`, `CHAOS_CONCURRENCY`, `CHAOS_TARGETS` (add `ledger-consumer` to kill the
 consumer too, i.e. F7 in the wild).
 
-GitHub Actions: `golangci-lint` → unit tests (`-race`) → integration tests
-(testcontainers runs on `ubuntu-latest` without extra setup) → coverage badge.
+`make load` (`scripts/load.sh`) starts the `app` profile and runs `cmd/loadgen` in three
+scenarios: API capacity (16 clients as fast as the API answers), steady state at a fixed
+rate below every component's capacity (the end-to-end lag), and a backlog drain (relays
+stopped, 10,000 payments written, then 1 relay + 1 consumer, then 2 relays + 3
+consumers). All pipeline numbers come from the database's timestamps
+(`outbox.created_at` → `published_at` → `processed_events.processed_at`), one clock.
+Results are in the README.
+
+GitHub Actions: `golangci-lint`, `promtool` (config + rule tests), unit tests (`-race`) →
+integration tests (testcontainers runs on `ubuntu-latest` without extra setup).
 
 ---
 
 ## 13. ADRs (`docs/adr/`)
 
-1. **Outbox polling vs. CDC (Debezium).** Polling is easier to run and fine for thousands of
-   events/s. CDC is better for very high volume or when the app can't change.
-2. **Hold row locks during publish vs. lease column.** We chose the tx-held lock because it gives
-   crash safety for free. It requires a hard publish bound, hence
+1. [**Outbox polling vs. CDC (Debezium).**](adr/0001-outbox-polling-vs-cdc.md) Polling is
+   easier to run and test and fine for thousands of events/s. CDC is better for very high
+   volume or when the app can't change.
+2. [**Hold row locks during publish vs. lease column.**](adr/0002-row-locks-during-publish.md)
+   The tx-held lock gives crash safety for free. It requires a hard publish bound, hence
    `AllowIdempotentProduceCancellation` (§7) and its duplicate trade-off.
-3. **`processed_events` table vs. Redis `SETNX`** for consumer idempotency (see §8).
-4. **Per-aggregate ordering via `NOT EXISTS` guard.** The cost is an extra index probe and
-   head-of-line blocking per aggregate, which is intended.
-5. **Money as `int64` minor units.** Covers why not `float64`, why not `decimal` here, and the
-   overflow limits (about 9.2·10^16 EUR).
-6. **franz-go over confluent-kafka-go.** Pure Go with no cgo, and an idempotent producer by default.
+3. [**`processed_events` table vs. Redis `SETNX`**](adr/0003-processed-events-vs-redis.md)
+   for consumer idempotency (see §8).
+4. [**Per-aggregate ordering via a guard in the claim.**](adr/0004-per-aggregate-ordering-guard.md)
+   The cost is an index probe per candidate row and head-of-line blocking per aggregate,
+   which is intended. Amended in M7: the `NOT EXISTS` form was quadratic under stale
+   statistics; the guard is now a unique-key probe of the previous version.
+5. [**Money as `int64` minor units.**](adr/0005-money-int64-minor-units.md) Why not
+   `float64`, why not `decimal` here, and the overflow limits (about 9.2·10^16 EUR).
+6. [**franz-go over confluent-kafka-go.**](adr/0006-franz-go.md) Pure Go with no cgo, an
+   idempotent producer by default, and the consumer-group controls the Runner needs.
 
 ---
 
@@ -851,7 +947,7 @@ GitHub Actions: `golangci-lint` → unit tests (`-race`) → integration tests
 | **M4 — Consumer** | ledger double-entry with the balance invariant, `processed_events`; `Processor` (dedup, retries, classification) and `Runner` (auto-commit off, commit after the DB commit, `BlockRebalanceOnPoll` + interrupt on a waiting rebalance, no commit past a failed DLQ send); `kafkax.DLQ`; e2e ends in a ledger transaction | F7, F8 tests pass ✅ |
 | **M5 — Crash scenario** | `Hooks.AfterPublish`, F5 test (two relays, backend killed after the ack), app image + compose profile, `make demo`, `make chaos` | F5 test passes, chaos run leaves ledger balanced ✅ |
 | **M6 — Tracing** | OTel across all three services (TraceContext + Baggage propagator), OTLP straight to Jaeger, Jaeger in compose, `trace_id` in logs | F10 test passes, screenshot in README ✅ |
-| **M7 — Polish** | README (diagram, guarantees, failure matrix), ADRs, simple load numbers; relay metrics from §7 (Prometheus) | A reviewer gets the point in 2 minutes |
+| **M7 — Polish** | README (diagram, guarantees, failure matrix), ADRs 0001–0006, load numbers (`cmd/loadgen`, `make load`); relay metrics (§7: OTel → Prometheus `/metrics`, backlog gauges, alert rules with `promtool` tests). Found and fixed by the load run: the claim was quadratic in the backlog under stale statistics (F11, ADR 0004 amendment), plus `statement_timeout` on relay sessions | A reviewer gets the point in 2 minutes; F11 and the metrics tests pass ✅ |
 
 **README order:** one-line pitch → diagram → "Guarantees" → failure-mode matrix with
 links to the tests → quickstart (`make up && make demo`) → Jaeger screenshot → ADR links.

@@ -1,10 +1,11 @@
 # Local dev stack. Image versions live in deploy/.env (shared with testcontainers).
 # Integration tests do NOT use this file; they start their own containers.
 #
-# Default services: postgres, redpanda, topics, jaeger (`make up`). The `app` profile adds
-# the binaries, built from deploy/Dockerfile: api, two relays and the ledger consumer
-# (`make app`, used by `make chaos`). They send traces over OTLP/HTTP straight to Jaeger:
-# UI on http://localhost:16686.
+# Default services: postgres, redpanda, topics, jaeger, prometheus (`make up`). The `app`
+# profile adds the binaries, built from deploy/Dockerfile: api, two relays and the ledger
+# consumer (`make app`, used by `make chaos`). They send traces over OTLP/HTTP straight to
+# Jaeger (UI on http://localhost:16686); Prometheus scrapes the relays' /metrics (UI on
+# http://localhost:9090, alert rules in deploy/prometheus/alerts.yml).
 name: t-outbox
 
 x-app: &app
@@ -124,6 +125,21 @@ services:
     ports:
       - "${JAEGER_UI_PORT:-16686}:16686"   # UI
       - "${OTLP_HTTP_PORT:-4318}:4318"     # OTLP/HTTP, for `make run-*`
+
+  # Scrapes relay-1/relay-2 (`make app`) and relays on the host (`make run-relay`) every
+  # 5s; see deploy/prometheus/prometheus.yml. Alerts are evaluated (UI: /alerts) but not
+  # routed anywhere: there is no Alertmanager in the dev stack.
+  prometheus:
+    image: ${PROMETHEUS_IMAGE}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=1d
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
 
 volumes:
   pgdata:

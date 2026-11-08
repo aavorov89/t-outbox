@@ -54,14 +54,9 @@ func Setup(ctx context.Context, service string, log *slog.Logger) (shutdown func
 		return noop, nil
 	}
 
-	res, err := resource.New(ctx,
-		resource.WithAttributes(semconv.ServiceName(service)),
-		resource.WithFromEnv(), // after the default name: OTEL_SERVICE_NAME wins
-		resource.WithTelemetrySDK(),
-		resource.WithHost(),
-	)
-	if err != nil && !errors.Is(err, resource.ErrPartialResource) {
-		return noop, fmt.Errorf("telemetry: resource: %w", err)
+	res, err := newResource(ctx, service)
+	if err != nil {
+		return noop, err
 	}
 
 	opts := []sdktrace.TracerProviderOption{sdktrace.WithResource(res)}
@@ -76,4 +71,19 @@ func Setup(ctx context.Context, service string, log *slog.Logger) (shutdown func
 	tp := sdktrace.NewTracerProvider(opts...)
 	otel.SetTracerProvider(tp)
 	return tp.Shutdown, nil
+}
+
+// newResource describes the process: service.name (OTEL_SERVICE_NAME wins), the
+// OTEL_RESOURCE_ATTRIBUTES (service.instance.id per relay in compose), SDK and host.
+func newResource(ctx context.Context, service string) (*resource.Resource, error) {
+	res, err := resource.New(ctx,
+		resource.WithAttributes(semconv.ServiceName(service)),
+		resource.WithFromEnv(), // after the default name: OTEL_SERVICE_NAME wins
+		resource.WithTelemetrySDK(),
+		resource.WithHost(),
+	)
+	if err != nil && !errors.Is(err, resource.ErrPartialResource) {
+		return nil, fmt.Errorf("telemetry: resource: %w", err)
+	}
+	return res, nil
 }

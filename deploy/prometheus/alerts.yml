@@ -1,0 +1,50 @@
+# Alerts on the relay metrics (ARCHITECTURE §7, "Metrics"). The backlog gauges describe the
+# table, and every relay reports the same values: aggregate them with max(), never sum().
+groups:
+  - name: outbox
+    rules:
+      # The main SLO signal. Healthy lag is below a second (poll interval 200ms, a full
+      # batch skips the sleep). It grows when the relays are down or stuck, Kafka is down,
+      # or one aggregate is blocked behind an event that keeps failing.
+      - alert: OutboxBacklogStale
+        expr: max(outbox_oldest_pending_age_seconds) > 60
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "Oldest unpublished outbox event is {{ $value | humanizeDuration }} old"
+          description: "Check outbox.last_error of the oldest pending rows, and the relays' logs."
+
+      # No relay can read the table: all relays are down, or the database is. The gauge
+      # above cannot fire then, so its absence is an alert of its own.
+      - alert: OutboxBacklogUnknown
+        expr: absent(outbox_oldest_pending_age_seconds)
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "No relay reports the outbox backlog (relays down or database unreachable)"
+
+      # Records keep failing at the producer. The relay retries forever with backoff, so
+      # this is a ticket; the backlog alert pages if it lasts.
+      - alert: OutboxPublishFailing
+        expr: sum by (messaging_destination_name) (rate(outbox_publish_failures_total{error_type="publish"}[5m])) > 0
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Outbox records to {{ $labels.messaging_destination_name }} keep failing to publish"
+
+      # A row that cannot be built never fixes itself and blocks the rest of its aggregate:
+      # someone has to repair or remove it.
+      - alert: OutboxUnbuildableRow
+        expr: increase(outbox_publish_failures_total{error_type="build"}[15m]) > 0
+        labels: {severity: ticket}
+        annotations:
+          summary: "An outbox row fails envelope validation and blocks its aggregate"
+          description: "SELECT id, aggregate_id, last_error FROM outbox WHERE published_at IS NULL AND attempts > 0"
+
+      # Whole cycles roll back (database down, transaction aborted): nothing gets marked.
+      - alert: OutboxRelayCyclesFailing
+        expr: sum by (instance) (rate(outbox_cycle_failures_total[5m])) > 0
+        for: 5m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Relay {{ $labels.instance }} keeps rolling back its cycles"
