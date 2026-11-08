@@ -1,0 +1,17 @@
+{
+  "event_id": "0192f0c4-7a3e-7b1c-9d2e-3f4a5b6c7d8e",
+  "event_type": "payment.captured",
+  "event_version": 1,
+  "aggregate_type": "payment",
+  "aggregate_id": "0192f0c1-1111-7222-8333-444455556666",
+  "aggregate_version": 2,
+  "occurred_at": "2026-11-08T12:00:00Z",
+  "data": {
+    "payment_id": "0192f0c1-1111-7222-8333-444455556666",
+    "merchant_id": "m_42",
+    "amount": {
+      "amount_minor": 1999,
+      "currency": "EUR"
+    }
+  }
+}

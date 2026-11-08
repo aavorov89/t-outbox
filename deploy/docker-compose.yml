@@ -1,0 +1,56 @@
+# Local dev stack. Image versions live in deploy/.env (shared with testcontainers).
+# Integration tests do NOT use this file; they start their own containers.
+name: t-outbox
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    environment:
+      POSTGRES_USER: outbox
+      POSTGRES_PASSWORD: outbox
+      POSTGRES_DB: outbox
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U outbox -d outbox"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redpanda:
+    image: ${REDPANDA_IMAGE}
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:${KAFKA_PORT:-19092}
+    ports:
+      - "${KAFKA_PORT:-19092}:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # One-shot: create topics with explicit partition counts (no auto-create).
+  topics:
+    image: ${REDPANDA_IMAGE}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        rpk -X brokers=redpanda:9092 topic create payments.events -p 6 -r 1 --if-not-exists &&
+        rpk -X brokers=redpanda:9092 topic create payments.events.dlq -p 1 -r 1 --if-not-exists
+    restart: "no"
+
+  # API, relays, consumer and Jaeger are added in M2–M6.
+
+volumes:
+  pgdata:
