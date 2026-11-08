@@ -42,9 +42,9 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 // Queue validates m and appends its INSERT to b, so the business write and the outbox
 // write go out in one round trip and commit together.
 //
-// Trace context from ctx is injected into the row's headers via the global OTel
-// propagator. Until telemetry is configured (M6) that propagator is a no-op and
-// headers stay empty.
+// Trace context from ctx (traceparent, tracestate, baggage) is injected into the row's
+// headers via the global OTel propagator, so the relay can continue the trace after the
+// async gap. Without telemetry.Setup that propagator is a no-op and headers stay empty.
 func Queue(ctx context.Context, b *pgx.Batch, m Message) error {
 	if err := m.toEnvelope().Validate(); err != nil {
 		return fmt.Errorf("outbox: invalid message: %w", err)

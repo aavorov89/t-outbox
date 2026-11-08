@@ -13,9 +13,16 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/aavorov89/t-outbox/internal/money"
 )
+
+const scopeName = "github.com/aavorov89/t-outbox/internal/ledger"
 
 // ErrUnbalanced means a transaction's entries do not sum to zero in some currency.
 var ErrUnbalanced = errors.New("ledger: unbalanced transaction")
@@ -107,7 +114,25 @@ FROM unnest($3::text[], $4::bigint[], $5::text[]) AS e(account, amount_minor, cu
 // Post validates t and inserts its entries in tx with one statement. The caller owns tx;
 // in the consumer it also holds the processed_events marker, so the entries and the
 // marker commit together.
-func Post(ctx context.Context, tx pgx.Tx, t Transaction) error {
+//
+// It runs in a span "ledger.post" (a child of the consumer's attempt span).
+func Post(ctx context.Context, tx pgx.Tx, t Transaction) (err error) {
+	ctx, span := otel.Tracer(scopeName).Start(ctx, "ledger.post",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			semconv.DBSystemNamePostgreSQL,
+			semconv.DBOperationName("INSERT"),
+			semconv.DBCollectionName("ledger_entries"),
+			attribute.String("ledger.transaction_id", t.ID.String()),
+			attribute.Int("ledger.entries", len(t.Entries)),
+		))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
 	if err := t.Validate(); err != nil {
 		return err
 	}

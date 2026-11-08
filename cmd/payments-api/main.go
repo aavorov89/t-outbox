@@ -18,6 +18,7 @@ import (
 
 	"github.com/aavorov89/t-outbox/internal/httpapi"
 	"github.com/aavorov89/t-outbox/internal/payment/postgres"
+	"github.com/aavorov89/t-outbox/internal/telemetry"
 )
 
 func main() {
@@ -30,7 +31,18 @@ func main() {
 func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("service", "payments-api")
+	log := slog.New(telemetry.LogHandler(slog.NewJSONHandler(os.Stdout, nil))).With("service", "payments-api")
+	shutdownTracing, err := telemetry.Setup(ctx, "payments-api", log)
+	if err != nil {
+		return err
+	}
+	defer func() { // flush the last spans; a slow Jaeger must not hold up the exit for long
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(ctx); err != nil {
+			log.Warn("telemetry shutdown", "err", err)
+		}
+	}()
 
 	pool, err := pgxpool.New(ctx, getenv("DATABASE_URL", "postgres://outbox:outbox@localhost:5432/outbox?sslmode=disable"))
 	if err != nil {

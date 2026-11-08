@@ -19,14 +19,16 @@ import (
 // ContentType is the value of the content-type Kafka header.
 const ContentType = "application/json"
 
-// Kafka header keys. The relay sets the first three itself from outbox columns;
-// trace headers come from outbox.headers.
+// Kafka header keys. The relay sets the first three itself from outbox columns. The W3C
+// trace headers (traceparent, tracestate, baggage) are injected by the relay's producer
+// span, continuing the trace context stored in outbox.headers.
 const (
 	HeaderEventID     = "event_id"
 	HeaderEventType   = "event_type"
 	HeaderContentType = "content-type"
 	HeaderTraceparent = "traceparent"
 	HeaderTracestate  = "tracestate"
+	HeaderBaggage     = "baggage"
 )
 
 // IsReserved reports whether a header key is owned by the relay and must not be

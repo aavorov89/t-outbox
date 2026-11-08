@@ -23,6 +23,7 @@ import (
 
 	"github.com/aavorov89/t-outbox/internal/kafkax"
 	"github.com/aavorov89/t-outbox/internal/outbox"
+	"github.com/aavorov89/t-outbox/internal/telemetry"
 )
 
 func main() {
@@ -35,7 +36,18 @@ func main() {
 func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("service", "outbox-relay")
+	log := slog.New(telemetry.LogHandler(slog.NewJSONHandler(os.Stdout, nil))).With("service", "outbox-relay")
+	shutdownTracing, err := telemetry.Setup(ctx, "outbox-relay", log)
+	if err != nil {
+		return err
+	}
+	defer func() { // flush the last spans; a slow Jaeger must not hold up the exit for long
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(ctx); err != nil {
+			log.Warn("telemetry shutdown", "err", err)
+		}
+	}()
 
 	cfg := outbox.DefaultConfig(getenv("KAFKA_TOPIC", "payments.events"))
 	cfg.Logger = log

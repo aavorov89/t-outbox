@@ -324,11 +324,13 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 		idx = append(idx, i)
 	}
 	if len(recs) > 0 {
+		spans := startSendSpans(rows, recs, idx)
 		pubCtx, cancel := context.WithTimeout(ctx, r.cfg.PublishTimeout)
 		perRec := r.producer.Produce(pubCtx, recs)
 		cancel()
 		for j, err := range perRec {
 			errs[idx[j]] = err
+			endSpan(spans[j], err)
 		}
 	}
 

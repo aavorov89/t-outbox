@@ -1,5 +1,9 @@
-// Package kafkax holds franz-go setup: producer and consumer options, the outbox.Producer
-// and consumer.DLQ implementations and, from M6, the OTel header carrier.
+// Package kafkax holds franz-go setup: producer and consumer options and the
+// outbox.Producer and consumer.DLQ implementations.
+//
+// Trace context needs nothing here: the relay injects it into outbox.Record.Headers, which
+// Produce copies into the Kafka headers as they are; the consumer reads it back with
+// telemetry.KafkaHeaders.
 package kafkax
 
 import (
@@ -11,6 +15,8 @@ import (
 
 	"github.com/aavorov89/t-outbox/internal/outbox"
 )
+
+const scopeName = "github.com/aavorov89/t-outbox/internal/kafkax"
 
 // DefaultDeliveryTimeout bounds how long Produce waits for a record. It is below
 // outbox.DefaultPublishTimeout, so the producer reports its own timeout error before the

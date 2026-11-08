@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -26,6 +27,7 @@ import (
 	"github.com/aavorov89/t-outbox/internal/consumer"
 	"github.com/aavorov89/t-outbox/internal/kafkax"
 	"github.com/aavorov89/t-outbox/internal/ledger"
+	"github.com/aavorov89/t-outbox/internal/telemetry"
 )
 
 func main() {
@@ -38,7 +40,18 @@ func main() {
 func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("service", "ledger-consumer")
+	log := slog.New(telemetry.LogHandler(slog.NewJSONHandler(os.Stdout, nil))).With("service", "ledger-consumer")
+	shutdownTracing, err := telemetry.Setup(ctx, "ledger-consumer", log)
+	if err != nil {
+		return err
+	}
+	defer func() { // flush the last spans; a slow Jaeger must not hold up the exit for long
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(ctx); err != nil {
+			log.Warn("telemetry shutdown", "err", err)
+		}
+	}()
 
 	brokers := strings.Split(getenv("KAFKA_BROKERS", "localhost:19092"), ",")
 	topic := getenv("KAFKA_TOPIC", "payments.events")

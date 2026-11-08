@@ -36,9 +36,10 @@ flowchart LR
     K --> L[ledger-consumer]
     L -->|1 tx: processed_events + ledger entries| PG
     L -->|poison / retries exhausted| DLQ[(Kafka<br/>payments.events.dlq)]
-    API -. traces .-> J[Jaeger / OTel Collector]
-    R1 -. traces .-> J
-    L -. traces .-> J
+    API -. OTLP .-> J[Jaeger]
+    R1 -. OTLP .-> J
+    R2 -. OTLP .-> J
+    L -. OTLP .-> J
 ```
 
 | Binary | Responsibility | Scales by |
@@ -71,9 +72,9 @@ binary so you can scale it on its own and kill it in tests.
 │   ├── consumer/         # Handler iface, error classification, DLQ iface; Processor + Runner
 │   │   └── consumertest/ # FakeDLQ
 │   ├── backoff/          # capped exponential backoff with jitter (relay and consumer)
-│   ├── kafkax/           # outbox.Producer and consumer.DLQ over franz-go, header carrier for OTel (M6)
-│   ├── telemetry/        # OTel tracer/meter providers, propagators
-│   ├── httpapi/          # handlers, RFC 9457 problems, middleware (recovery, logging; otelhttp in M6)
+│   ├── kafkax/           # outbox.Producer and consumer.DLQ over franz-go
+│   ├── telemetry/        # OTel setup (tracer provider, OTLP exporter, propagator), Kafka header carrier, slog trace IDs
+│   ├── httpapi/          # handlers, RFC 9457 problems, middleware (otelhttp, recovery, logging)
 │   └── testenv/          # testcontainers harness (build tag: integration)
 ├── cmd/migrate/          # applies embedded migrations (used by `make up`)
 ├── migrations/           # goose SQL migrations, embedded; Up() shared by cmd/migrate and testenv
@@ -81,7 +82,7 @@ binary so you can scale it on its own and kill it in tests.
 ├── deploy/
 │   ├── .env              # image versions: single source for compose AND testcontainers
 │   ├── Dockerfile        # one image with all binaries
-│   └── docker-compose.yml  # postgres, redpanda (+ topic init); profile `app`: api, 2 relays, consumer
+│   └── docker-compose.yml  # postgres, redpanda (+ topic init), jaeger; profile `app`: api, 2 relays, consumer
 ├── scripts/              # demo.sh, chaos.sh (make demo, make chaos)
 ├── docs/
 │   ├── ARCHITECTURE.md
@@ -259,8 +260,8 @@ to mock it, and it is tested against real Postgres.
 
 - The two inserts go in one network round trip and commit or roll back together.
 - `outbox.Queue` fills the row's headers with `otel.GetTextMapPropagator().Inject(ctx, ...)`
-  while the HTTP span is active, so the trace survives the async gap. Until M6 the global
-  propagator is a no-op and headers stay `{}`; nothing changes in the signature later.
+  while the write transaction's span is active, so the trace survives the async gap (§9).
+  Without `telemetry.Setup` (unit tests) the global propagator is a no-op and headers stay `{}`.
 - **Writer invariant:** events of one aggregate are queued while holding a lock on it
   (`FOR UPDATE` on the payment, or the payment row not being committed yet). Otherwise
   `outbox.id` order can differ from commit order and the ordering guard in §7 breaks.
@@ -422,7 +423,9 @@ type Config struct {
 }
 ```
 
-### Metrics (M6)
+### Metrics (M7)
+Not in M6: the services export OTLP straight to Jaeger, which takes traces only, so metrics
+need a backend of their own (Prometheus). Planned:
 `outbox_pending_total`, `outbox_oldest_pending_age_seconds` (the main SLO signal),
 `outbox_publish_duration_seconds`, `outbox_publish_failures_total`.
 
@@ -583,23 +586,55 @@ Replay is safe because the consumer is idempotent.
 
 ## 9. Distributed tracing (OpenTelemetry)
 
+One trace per HTTP request, across both async gaps (outbox table, Kafka):
+
 ```
-HTTP POST /payments         (server span, otelhttp)
- └─ db: insert payment+outbox
-      ⋯ async gap: traceparent stored in outbox.headers ⋯
- └─ outbox.publish payments.events   (producer span, parent = extracted ctx)
-      ⋯ traceparent in Kafka headers ⋯
-      └─ payments.events process     (consumer span)
-           └─ db: ledger post
+POST /payments/{id}/capture      server    payments-api  (otelhttp; continues a client's traceparent)
+ └─ payment.update               client    payments-api  (the write tx; outbox.headers stores its context)
+      ⋯ async gap: traceparent + baggage in outbox.headers ⋯
+     └─ send payments.events     producer  outbox-relay  (parent extracted from outbox.headers)
+          ⋯ traceparent + baggage in the Kafka headers ⋯
+         └─ process payments.events  consumer  ledger-consumer  (parent extracted from the Kafka headers)
+             └─ apply ledger     client    ledger-consumer  (one attempt: processed_events + side effect)
+                 └─ ledger.post            ledger-consumer  (payment.captured only)
+             └─ send payments.events.dlq  producer      (only when the record is dead-lettered)
 ```
 
-- `kafkax.HeaderCarrier` implements `propagation.TextMapCarrier` over `[]kgo.RecordHeader`.
-  It is written by hand on purpose, so the propagation is visible in code.
-- The relay **extracts** context from `outbox.headers`, starts a `SpanKindProducer` span, and
-  **injects** into the Kafka headers. The consumer extracts it and starts `SpanKindConsumer`.
-- Semantic conventions: `messaging.system=kafka`, `messaging.destination.name`,
-  `messaging.kafka.message.key`, `messaging.message.id=event_id`.
-- docker-compose runs Jaeger. The README includes a screenshot of one trace covering all three services.
+![One capture in Jaeger: API → relay → consumer](img/jaeger-trace.png)
+
+- **Propagator:** W3C TraceContext + Baggage (`telemetry.Propagator`), installed globally by
+  `telemetry.Setup`. Baggage (e.g. `tenant=t_42` from an upstream caller) travels the same
+  way as `traceparent`: HTTP → `outbox.headers` → Kafka headers → consumer ctx.
+- **Export:** OTLP/HTTP straight to Jaeger, which accepts OTLP natively; no collector in
+  between. On when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (`make run-*` and compose set it).
+  Without it, spans are still created, so trace IDs reach the logs and the headers. The
+  usual `OTEL_*` variables apply (`OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`,
+  `OTEL_TRACES_SAMPLER`, `OTEL_SDK_DISABLED`); compose sets `service.instance.id` per relay.
+  Spans are batched and exported in the background: Jaeger being down costs dropped spans
+  and a warning, never a failed request or a stuck relay.
+- **Instrumented code uses only the global API** (`otel.Tracer`, `otel.GetTextMapPropagator`),
+  so packages don't depend on `telemetry` setup and tests without it pay nothing.
+- **Relay:** for each record of a batch, `startSendSpans` extracts the context from the row's
+  `outbox.headers`, starts a `SpanKindProducer` span and injects it into the record's headers,
+  replacing the API's `traceparent`. The relay's own loop is never a parent: one batch
+  carries events of many unrelated requests, and an idle poll creates no spans. A failed
+  publish ends its span with an error; the retry gets a new span (`outbox.attempt`).
+- **Consumer:** `telemetry.KafkaHeaders` is a `propagation.TextMapCarrier` over
+  `[]kgo.RecordHeader`, written by hand so the propagation is visible in code. The runner
+  extracts with it and starts `SpanKindConsumer` per record; each Processor attempt is a
+  child span, so retries show up as siblings. A duplicate (F5) has the same parent as the
+  first delivery: the trace shows two `send` and two `process` spans, the second one with
+  `consumer.duplicate=true`.
+- **DLQ:** the send to the DLQ is a producer span under the record's consumer span, but the
+  DLQ record keeps the *original* `traceparent`, so a replay joins the writing request's trace.
+- **Semantic conventions** (semconv v1.43): `messaging.system=kafka`,
+  `messaging.operation.type`, `messaging.destination.name`, `messaging.kafka.message.key`,
+  `messaging.message.id=event_id`, partition and offset on the consumer side; `db.system.name`
+  on the transaction spans; `http.route` on the server span.
+- **Logs:** `telemetry.LogHandler` adds `trace_id` and `span_id` to every slog line logged
+  with a context, so a log line leads to its trace in Jaeger and back.
+- **Local:** `make up` starts Jaeger (UI on http://localhost:16686). `make run-*` and
+  `make app` export to it.
 
 ---
 
@@ -747,8 +782,13 @@ worker's tx dies on the server side, as it would after a `kill -9` of the proces
   duplicates, retry with rollback, exhaustion leaves no marker, permanent errors are not
   retried (including a real `23514`), panic, cancellation, 8 concurrent deliveries of one
   event, independent consumer names.
-- **F10:** `tracetest.NewInMemoryExporter()` for all three components in-process. Assert one trace ID
-  and the parent/child chain.
+- **F10** (`TestTracing_EndToEnd`): API, relay and consumer in-process with one SDK tracer
+  provider and `tracetest.NewInMemoryExporter()`. An upstream "checkout" span sends
+  `traceparent` and `baggage` with the create and the capture. Asserts: `outbox.headers`
+  holds the write tx's span and the baggage, the Kafka record holds the producer span and
+  the baggage; every span is in the caller's trace; for each event the chain server → tx →
+  producer → consumer → apply (→ `ledger.post`) with the right kinds and remote parents at
+  both hand-offs; messaging attributes; no stray spans (idle relay cycles create none).
 - Unit tests (no containers) for `money`, the payment state machine, the backoff policy, and error classification.
 - `make test` runs unit tests only (no Docker). `make test-integration` runs
   `go test -tags=integration -race ./...`; it starts its own containers and does not need `make up`.
@@ -758,7 +798,7 @@ worker's tx dies on the server side, as it would after a `kill -9` of the proces
 ## 12. Local run and CI
 
 ```
-make up        # docker compose: postgres, redpanda + topics, migrations (later: jaeger)
+make up        # docker compose: postgres, redpanda + topics, jaeger (UI :16686), migrations
 make app       # profile `app`: api (:8080), relay-1, relay-2, ledger-consumer from deploy/Dockerfile
 make lint      # golangci-lint in Docker, as your uid
 make demo      # curl script: create + capture 100 payments, wait for the consumer, print the ledger
@@ -807,11 +847,11 @@ GitHub Actions: `golangci-lint` → unit tests (`-race`) → integration tests
 |---|---|---|
 | **M1 — Foundations** | repo skeleton, `money` + tests, migrations, docker-compose, CI; **event contract** (`internal/event` + golden files); **interfaces** (`outbox.Queue`/`Producer`/`Relay`, `consumer.Handler`/`DLQ`) with fakes; **harness** (`internal/testenv`) + smoke tests; F1–F10 stubs | `make up` works, lint, unit and integration tests green ✅ |
 | **M2 — Walking skeleton** | `POST /payments` → `pgx.Batch` repo → naive relay (no `SKIP LOCKED`, no retries, single instance) → Kafka → consumer that only logs; UUIDv7 ids, RFC 9457 errors, API idempotency (same key + different body → 422) | F1–F3 and the end-to-end test pass ✅ |
-| **M3 — Hardening the write path and the relay** | capture endpoint with `Idempotency-Key` (`Repo.Update` under `FOR UPDATE`); claim/publish/mark in one tx with `SKIP LOCKED` + `NOT EXISTS` ordering guard, per-record backoff, timeout chain checked at start-up, graceful shutdown with drain timeout. Metrics move to M6 (OTel meters) | F1–F4, F6, F9 pass; `TestEndToEnd_PaymentEventsReachConsumer` covers create + capture ✅ |
+| **M3 — Hardening the write path and the relay** | capture endpoint with `Idempotency-Key` (`Repo.Update` under `FOR UPDATE`); claim/publish/mark in one tx with `SKIP LOCKED` + `NOT EXISTS` ordering guard, per-record backoff, timeout chain checked at start-up, graceful shutdown with drain timeout. Metrics moved out (now M7) | F1–F4, F6, F9 pass; `TestEndToEnd_PaymentEventsReachConsumer` covers create + capture ✅ |
 | **M4 — Consumer** | ledger double-entry with the balance invariant, `processed_events`; `Processor` (dedup, retries, classification) and `Runner` (auto-commit off, commit after the DB commit, `BlockRebalanceOnPoll` + interrupt on a waiting rebalance, no commit past a failed DLQ send); `kafkax.DLQ`; e2e ends in a ledger transaction | F7, F8 tests pass ✅ |
 | **M5 — Crash scenario** | `Hooks.AfterPublish`, F5 test (two relays, backend killed after the ack), app image + compose profile, `make demo`, `make chaos` | F5 test passes, chaos run leaves ledger balanced ✅ |
-| **M6 — Tracing and metrics** | OTel across all three services, Jaeger in compose; relay metrics from §7 | F10 test passes, screenshot in README |
-| **M7 — Polish** | README (diagram, guarantees, failure matrix), ADRs, simple load numbers | A reviewer gets the point in 2 minutes |
+| **M6 — Tracing** | OTel across all three services (TraceContext + Baggage propagator), OTLP straight to Jaeger, Jaeger in compose, `trace_id` in logs | F10 test passes, screenshot in README ✅ |
+| **M7 — Polish** | README (diagram, guarantees, failure matrix), ADRs, simple load numbers; relay metrics from §7 (Prometheus) | A reviewer gets the point in 2 minutes |
 
 **README order:** one-line pitch → diagram → "Guarantees" → failure-mode matrix with
 links to the tests → quickstart (`make up && make demo`) → Jaeger screenshot → ADR links.

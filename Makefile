@@ -8,9 +8,9 @@ UIDGID       := $(shell id -u):$(shell id -g)
 
 .PHONY: up down app migrate run-api run-relay run-consumer demo chaos test test-integration lint fmt tidy
 
-## Local stack: postgres + redpanda (+ topics), then migrations.
+## Local stack: postgres + redpanda (+ topics) + jaeger (UI :16686), then migrations.
 up:
-	$(COMPOSE) up -d --wait postgres redpanda
+	$(COMPOSE) up -d --wait postgres redpanda jaeger
 	$(COMPOSE) up topics
 	DATABASE_URL='$(DATABASE_URL)' $(GO) run ./cmd/migrate
 
@@ -25,16 +25,18 @@ app:
 migrate:
 	DATABASE_URL='$(DATABASE_URL)' $(GO) run ./cmd/migrate
 
-## The three binaries against the `make up` stack (one terminal each).
+## The three binaries against the `make up` stack (one terminal each), tracing to Jaeger.
 KAFKA_BROKERS ?= localhost:19092
+OTEL_EXPORTER_OTLP_ENDPOINT ?= http://localhost:4318
+RUN_ENV := DATABASE_URL='$(DATABASE_URL)' OTEL_EXPORTER_OTLP_ENDPOINT='$(OTEL_EXPORTER_OTLP_ENDPOINT)'
 run-api:
-	DATABASE_URL='$(DATABASE_URL)' $(GO) run ./cmd/payments-api
+	$(RUN_ENV) $(GO) run ./cmd/payments-api
 
 run-relay:
-	DATABASE_URL='$(DATABASE_URL)' KAFKA_BROKERS='$(KAFKA_BROKERS)' $(GO) run ./cmd/outbox-relay
+	$(RUN_ENV) KAFKA_BROKERS='$(KAFKA_BROKERS)' $(GO) run ./cmd/outbox-relay
 
 run-consumer:
-	DATABASE_URL='$(DATABASE_URL)' KAFKA_BROKERS='$(KAFKA_BROKERS)' $(GO) run ./cmd/ledger-consumer
+	$(RUN_ENV) KAFKA_BROKERS='$(KAFKA_BROKERS)' $(GO) run ./cmd/ledger-consumer
 
 ## Create and capture 100 payments via the API (make app, or the run-* targets), wait for
 ## the consumer, print the ledger balance. DEMO_PAYMENTS, DEMO_CONCURRENCY, API_URL.

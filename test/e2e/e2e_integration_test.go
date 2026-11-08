@@ -23,6 +23,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/aavorov89/t-outbox/internal/consumer"
 	"github.com/aavorov89/t-outbox/internal/event"
@@ -31,6 +38,7 @@ import (
 	"github.com/aavorov89/t-outbox/internal/ledger"
 	"github.com/aavorov89/t-outbox/internal/outbox"
 	"github.com/aavorov89/t-outbox/internal/payment/postgres"
+	"github.com/aavorov89/t-outbox/internal/telemetry"
 	"github.com/aavorov89/t-outbox/internal/testenv"
 )
 
@@ -90,7 +98,7 @@ func TestEndToEnd_PaymentEventsReachConsumer(t *testing.T) {
 	t.Cleanup(func() { cancel(); wg.Wait() })
 
 	// 1. Create a payment.
-	created := createPayment(t, api, "m_42", 1999)
+	created := createPayment(t.Context(), t, api, "m_42", 1999)
 
 	var eventID uuid.UUID
 	require.NoError(t, pool.QueryRow(ctx,
@@ -138,7 +146,7 @@ func TestEndToEnd_PaymentEventsReachConsumer(t *testing.T) {
 	}, 10*time.Second, 50*time.Millisecond, "outbox row must be marked published")
 
 	// 4. Capture it: payment.captured follows on the same partition.
-	capturePayment(t, api, created.ID)
+	capturePayment(t.Context(), t, api, created.ID)
 
 	var c received
 	select {
@@ -213,8 +221,8 @@ func TestRelay_CrashAfterPublishBeforeMark(t *testing.T) {
 	const payments = 3
 	paymentIDs := make([]uuid.UUID, payments)
 	for i := range paymentIDs {
-		paymentIDs[i] = createPayment(t, api, fmt.Sprintf("m_%d", i), int64(1000+i)).ID
-		capturePayment(t, api, paymentIDs[i])
+		paymentIDs[i] = createPayment(t.Context(), t, api, fmt.Sprintf("m_%d", i), int64(1000+i)).ID
+		capturePayment(t.Context(), t, api, paymentIDs[i])
 	}
 	eventOf := outboxEvents(t, pool) // outbox.id → event_id
 	require.Len(t, eventOf, 2*payments)
@@ -363,6 +371,217 @@ func TestRelay_CrashAfterPublishBeforeMark(t *testing.T) {
 	require.NoError(t, ledger.CheckBalanced(ctx, pool))
 }
 
+// F10: the trace crosses both async gaps. API, relay and consumer run in-process with one
+// SDK tracer provider and an in-memory exporter. An upstream caller sends traceparent and
+// baggage with both requests (create, then capture); afterwards every span of the system
+// is in that caller's trace, and each event forms the chain
+//
+//	POST /payments[/{id}/capture]  server    (otelhttp)
+//	 └─ payment.create|update      client    (the tx; outbox.headers stores its context)
+//	     └─ send <topic>           producer  (relay; parent extracted from outbox.headers)
+//	         └─ process <topic>    consumer  (parent extracted from the Kafka headers)
+//	             └─ apply ledger   client    (processed_events + side effect, one tx)
+//	                 └─ ledger.post          (payment.captured only)
+func TestTracing_EndToEnd(t *testing.T) {
+	testenv.NoLeaks(t)
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(telemetry.Propagator())
+	t.Cleanup(func() { // runs last: after the relay and the consumer stopped
+		otel.SetTracerProvider(tracenoop.NewTracerProvider())
+		otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator())
+		assert.NoError(t, tp.Shutdown(context.Background()))
+	})
+
+	log := slog.New(telemetry.LogHandler(slog.NewTextHandler(t.Output(), nil)))
+	pool := env.PG.NewPool(t, outbox.ConfigurePool)
+	topic := env.Kafka.NewTopic(t, 3)
+
+	// The components are built after the global provider is set (otelhttp reads it then).
+	api := httptest.NewServer(httpapi.New(postgres.New(pool), httpapi.Options{Logger: log.With("service", "api")}))
+	t.Cleanup(api.Close)
+	producerCl := env.Kafka.NewClient(t, kafkax.ProducerOpts(env.Kafka.Brokers, 5*time.Second)...)
+	dlqCl := env.Kafka.NewClient(t, kafkax.ProducerOpts(env.Kafka.Brokers, 5*time.Second)...)
+	relay := outbox.NewRelay(pool, kafkax.NewProducer(producerCl), outbox.Config{
+		Topic:        topic,
+		BatchSize:    10,
+		PollInterval: 20 * time.Millisecond,
+		Logger:       log.With("service", "relay"),
+	})
+	got := make(chan *kgo.Record, 10)
+	consumerLog := log.With("service", "consumer")
+	ledgerConsumer := consumer.NewRunner(
+		consumer.NewProcessor(pool, ledger.Handler{}, consumer.ProcessorConfig{Consumer: ledger.ConsumerName, Logger: consumerLog}),
+		kafkax.NewDLQ(dlqCl, topic+".dlq"),
+		consumer.RunnerConfig{Logger: consumerLog, Hooks: consumer.RunnerHooks{
+			Handled: func(rec *kgo.Record, _ consumer.Result, err error) {
+				assert.NoError(t, err)
+				got <- rec
+			},
+		}},
+		kafkax.ConsumerOpts(env.Kafka.Brokers, "ledger-"+topic, topic)...)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Go(func() { assert.NoError(t, relay.Run(ctx)) })
+	wg.Go(func() { assert.NoError(t, ledgerConsumer.Run(ctx)) })
+	t.Cleanup(func() { cancel(); wg.Wait() })
+
+	// 1. The upstream caller: a client span plus a baggage member, sent with both requests.
+	member, err := baggage.NewMember("tenant", "t_42")
+	require.NoError(t, err)
+	bag, err := baggage.New(member)
+	require.NoError(t, err)
+	callerCtx, caller := tp.Tracer("upstream").Start(baggage.ContextWithBaggage(t.Context(), bag), "checkout",
+		trace.WithSpanKind(trace.SpanKindClient))
+	created := createPayment(callerCtx, t, api, "m_42", 1999)
+	capturePayment(callerCtx, t, api, created.ID)
+	caller.End()
+	traceID := caller.SpanContext().TraceID()
+
+	// 2. outbox.headers holds the context of the write tx and the baggage.
+	rows, err := pool.Query(ctx, `SELECT event_type, headers FROM outbox WHERE aggregate_id = $1`, created.ID.String())
+	require.NoError(t, err)
+	stored := map[string]map[string]string{}
+	var (
+		typ     string
+		headers map[string]string
+	)
+	_, err = pgx.ForEachRow(rows, []any{&typ, &headers}, func() error { stored[typ] = headers; return nil })
+	require.NoError(t, err)
+	require.Len(t, stored, 2)
+	for typ, h := range stored {
+		require.Contains(t, h[event.HeaderTraceparent], traceID.String(), "%s: traceparent of the caller's trace", typ)
+		require.Equal(t, "tenant=t_42", h[event.HeaderBaggage], typ)
+	}
+
+	// 3. Both events reach the consumer, each carrying a traceparent and the baggage.
+	recs := map[string]*kgo.Record{}
+	for range 2 {
+		select {
+		case rec := <-got:
+			recs[headerValue(rec, event.HeaderEventType)] = rec
+		case <-time.After(30 * time.Second):
+			t.Fatal("consumer did not handle both events within 30s")
+		}
+	}
+	require.Len(t, recs, 2)
+	for typ, rec := range recs {
+		require.Equal(t, "tenant=t_42", headerValue(rec, event.HeaderBaggage), "%s: baggage crosses Kafka", typ)
+	}
+
+	// 4. The spans: the consumer ends its span right after the Handled hook, so wait for
+	// the last ones (the two process spans).
+	var spans tracetest.SpanStubs
+	require.Eventually(t, func() bool {
+		spans = exp.GetSpans()
+		return len(spans.Snapshots()) > 0 && len(byName(spans, "process "+topic)) == 2
+	}, 10*time.Second, 20*time.Millisecond)
+
+	for _, s := range spans {
+		require.Equal(t, traceID, s.SpanContext.TraceID(), "span %q is in the caller's trace", s.Name)
+	}
+
+	wantChain := map[string][]string{
+		event.TypePaymentCreated: {"POST /payments", "payment.create", "send " + topic, "process " + topic,
+			"apply " + ledger.ConsumerName},
+		event.TypePaymentCaptured: {"POST /payments/{id}/capture", "payment.update", "send " + topic, "process " + topic,
+			"apply " + ledger.ConsumerName, "ledger.post"},
+	}
+	wantKinds := []trace.SpanKind{trace.SpanKindServer, trace.SpanKindClient, trace.SpanKindProducer,
+		trace.SpanKindConsumer, trace.SpanKindClient, trace.SpanKindClient}
+	for typ, want := range wantChain {
+		eventID := headerValue(recs[typ], event.HeaderEventID)
+		leaf := findLeaf(t, spans, want[len(want)-1], eventID, topic)
+		chain := ancestry(spans, leaf)
+		names := make([]string, len(chain))
+		for i, s := range chain {
+			names[i] = s.Name
+			require.Equal(t, wantKinds[i], s.SpanKind, "%s: kind of %q", typ, s.Name)
+		}
+		require.Equal(t, want, names, "%s: parent/child chain", typ)
+		require.Equal(t, caller.SpanContext().SpanID(), chain[0].Parent.SpanID(), "%s: the server span's parent is the caller", typ)
+		require.True(t, chain[0].Parent.IsRemote())
+
+		// The hand-offs: outbox.headers carries the tx span, Kafka the producer span.
+		tx, send, process := chain[1], chain[2], chain[3]
+		require.Contains(t, stored[typ][event.HeaderTraceparent], tx.SpanContext.SpanID().String(), "%s: outbox.headers", typ)
+		require.Contains(t, headerValue(recs[typ], event.HeaderTraceparent), send.SpanContext.SpanID().String(), "%s: Kafka headers", typ)
+		require.True(t, send.Parent.IsRemote(), "send's parent comes from outbox.headers")
+		require.True(t, process.Parent.IsRemote(), "process' parent comes from the Kafka headers")
+
+		for _, s := range []tracetest.SpanStub{send, process} {
+			attrs := attrMap(s)
+			require.Equal(t, "kafka", attrs["messaging.system"], s.Name)
+			require.Equal(t, topic, attrs["messaging.destination.name"], s.Name)
+			require.Equal(t, eventID, attrs["messaging.message.id"], s.Name)
+			require.Equal(t, created.ID.String(), attrs["messaging.kafka.message.key"], s.Name)
+		}
+		require.Equal(t, "false", attrMap(process)["consumer.duplicate"])
+	}
+
+	// 5. Nothing else: one trace, no stray spans (an idle relay cycle creates none).
+	require.Len(t, spans, 1+len(wantChain[event.TypePaymentCreated])+len(wantChain[event.TypePaymentCaptured]),
+		"the caller's span and the two chains")
+}
+
+// byName returns the spans called name.
+func byName(spans tracetest.SpanStubs, name string) []tracetest.SpanStub {
+	var out []tracetest.SpanStub
+	for _, s := range spans {
+		if s.Name == name {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// findLeaf returns the span called name in the subtree of the process span of eventID.
+func findLeaf(t *testing.T, spans tracetest.SpanStubs, name, eventID, topic string) tracetest.SpanStub {
+	t.Helper()
+	var process []tracetest.SpanStub
+	for _, s := range byName(spans, "process "+topic) {
+		if attrMap(s)["messaging.message.id"] == eventID {
+			process = append(process, s)
+		}
+	}
+	require.Len(t, process, 1, "one process span for event %s", eventID)
+	for _, s := range byName(spans, name) {
+		for _, a := range ancestry(spans, s) {
+			if a.SpanContext.SpanID() == process[0].SpanContext.SpanID() {
+				return s
+			}
+		}
+	}
+	t.Fatalf("no span %q under the process span of event %s", name, eventID)
+	return tracetest.SpanStub{}
+}
+
+// ancestry returns s and its exported ancestors, root first.
+func ancestry(spans tracetest.SpanStubs, s tracetest.SpanStub) []tracetest.SpanStub {
+	byID := map[trace.SpanID]tracetest.SpanStub{}
+	for _, sp := range spans {
+		byID[sp.SpanContext.SpanID()] = sp
+	}
+	chain := []tracetest.SpanStub{s}
+	for {
+		parent, ok := byID[chain[0].Parent.SpanID()]
+		if !ok || parent.Name == "checkout" { // stop below the caller's span
+			return chain
+		}
+		chain = append([]tracetest.SpanStub{parent}, chain...)
+	}
+}
+
+func attrMap(s tracetest.SpanStub) map[string]string {
+	m := map[string]string{}
+	for _, a := range s.Attributes {
+		m[string(a.Key)] = a.Value.String()
+	}
+	return m
+}
+
 // crash records the one simulated relay death of F5.
 type crash struct {
 	mu    sync.Mutex
@@ -436,15 +655,17 @@ func (c *consumed) byEvent() (applied, duplicates map[uuid.UUID]int) {
 
 // ---- helpers ----
 
-// call sends a request to the API and returns the status and body.
-func call(t *testing.T, api *httptest.Server, method, path, body string) (int, []byte) {
+// call sends a request to the API and returns the status and body. The trace context of
+// ctx, if any, goes along as traceparent/baggage headers (as from an upstream service).
+func call(ctx context.Context, t *testing.T, api *httptest.Server, method, path, body string) (int, []byte) {
 	t.Helper()
 	var r io.Reader
 	if body != "" {
 		r = strings.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(context.Background(), method, api.URL+path, r)
+	req, err := http.NewRequestWithContext(ctx, method, api.URL+path, r)
 	require.NoError(t, err)
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -457,9 +678,9 @@ func call(t *testing.T, api *httptest.Server, method, path, body string) (int, [
 	return resp.StatusCode, b
 }
 
-func createPayment(t *testing.T, api *httptest.Server, merchant string, amountMinor int64) httpapi.PaymentResponse {
+func createPayment(ctx context.Context, t *testing.T, api *httptest.Server, merchant string, amountMinor int64) httpapi.PaymentResponse {
 	t.Helper()
-	status, body := call(t, api, http.MethodPost, "/payments",
+	status, body := call(ctx, t, api, http.MethodPost, "/payments",
 		fmt.Sprintf(`{"merchant_id":%q,"amount":{"amount_minor":%d,"currency":"EUR"}}`, merchant, amountMinor))
 	require.Equal(t, http.StatusCreated, status, string(body))
 	var p httpapi.PaymentResponse
@@ -467,9 +688,9 @@ func createPayment(t *testing.T, api *httptest.Server, merchant string, amountMi
 	return p
 }
 
-func capturePayment(t *testing.T, api *httptest.Server, id uuid.UUID) {
+func capturePayment(ctx context.Context, t *testing.T, api *httptest.Server, id uuid.UUID) {
 	t.Helper()
-	status, body := call(t, api, http.MethodPost, "/payments/"+id.String()+"/capture", "")
+	status, body := call(ctx, t, api, http.MethodPost, "/payments/"+id.String()+"/capture", "")
 	require.Equal(t, http.StatusOK, status, string(body))
 }
 
@@ -494,7 +715,3 @@ func headerValue(rec *kgo.Record, key string) string {
 	}
 	return ""
 }
-
-// F10: API, relay and consumer in-process with tracetest.NewInMemoryExporter; all spans
-// share one trace ID and form the HTTP → producer → consumer → db chain.
-func TestTracing_EndToEnd(t *testing.T) { t.Skip("M6") }

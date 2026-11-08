@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/aavorov89/t-outbox/internal/backoff"
 )
@@ -257,13 +258,22 @@ func (r *Runner) handlePoll(ctx context.Context, cl *kgo.Client, fetches kgo.Fet
 
 // handle processes rec and, if that failed for good, sends it to the DLQ. It reports
 // whether rec is handled, i.e. its offset may be committed. A non-nil error stops Run.
+//
+// It runs in the record's consumer span (see startProcessSpan): the Processor's attempts
+// and the DLQ send are its children.
 func (r *Runner) handle(ctx context.Context, rec *kgo.Record) (bool, error) {
+	ctx, span := startProcessSpan(ctx, rec, r.proc.cfg.Consumer)
+	defer span.End()
+
 	res, err := r.proc.Process(ctx, rec)
+	span.SetAttributes(attribute.Int("consumer.attempts", res.Attempts), attribute.Bool("consumer.duplicate", res.Duplicate))
 	if err == nil {
 		r.handled(rec, res, nil)
 		return true, nil
 	}
+	failSpan(span, err)
 	if ctx.Err() != nil {
+		span.SetAttributes(attribute.Bool("consumer.interrupted", true))
 		return false, nil //nolint:nilerr // interrupted (rebalance or shutdown): not handled, not failed
 	}
 	log := r.cfg.Logger.With("topic", rec.Topic, "partition", rec.Partition, "offset", rec.Offset,
@@ -277,11 +287,13 @@ func (r *Runner) handle(ctx context.Context, rec *kgo.Record) (bool, error) {
 	dlqErr := r.dlq.Send(dlqCtx, rec, err, res.Attempts)
 	cancel()
 	if dlqErr != nil {
+		span.RecordError(dlqErr)
 		if ctx.Err() == nil {
 			log.ErrorContext(ctx, "consumer: DLQ send failed; offset not committed", "dlq_err", dlqErr)
 		}
 		return false, nil
 	}
+	span.SetAttributes(attribute.Bool("consumer.dead_lettered", true))
 	log.WarnContext(ctx, "consumer: record sent to DLQ", "permanent", IsPermanent(err))
 	r.handled(rec, res, err)
 	return true, nil

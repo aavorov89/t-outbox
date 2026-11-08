@@ -3,7 +3,11 @@ package httpapi
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
+
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type statusRecorder struct {
@@ -23,8 +27,17 @@ func (a *api) logRequests(next http.Handler) http.Handler {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
+		// The mux sets r.Pattern ("POST /payments/{id}"); otelhttp names the span after it
+		// but reads http.route only before routing, so it is added here.
+		route := r.Pattern
+		if _, path, ok := strings.Cut(route, " "); ok {
+			route = path
+		}
+		if route != "" {
+			trace.SpanFromContext(r.Context()).SetAttributes(semconv.HTTPRoute(route))
+		}
 		a.log.InfoContext(r.Context(), "http request",
-			"method", r.Method, "path", r.URL.Path, "status", rec.status,
+			"method", r.Method, "path", r.URL.Path, "route", route, "status", rec.status,
 			"duration", time.Since(start))
 	})
 }

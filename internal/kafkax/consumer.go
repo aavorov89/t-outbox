@@ -8,6 +8,11 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/aavorov89/t-outbox/internal/consumer"
 )
@@ -45,10 +50,29 @@ func NewDLQ(cl *kgo.Client, topic string) *DLQ {
 
 // Send produces DLQRecord(rec, ...) and waits for the ack. Only a nil error lets the
 // consumer commit rec's offset.
+//
+// The send has a producer span of its own, a child of the consumer's span in ctx. The DLQ
+// record keeps the original traceparent, not this span's: a replay from the DLQ then joins
+// the trace of the request that wrote the event.
 func (d *DLQ) Send(ctx context.Context, rec *kgo.Record, cause error, attempts int) error {
+	ctx, span := otel.Tracer(scopeName).Start(ctx, "send "+d.topic,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			semconv.MessagingSystemKafka,
+			semconv.MessagingOperationTypeSend,
+			semconv.MessagingOperationName("send"),
+			semconv.MessagingDestinationName(d.topic),
+			semconv.MessagingKafkaMessageKey(string(rec.Key)),
+			attribute.String("dlq.original_topic", rec.Topic),
+			attribute.Int("dlq.attempts", attempts),
+		))
+	defer span.End()
 	out := DLQRecord(d.topic, rec, cause, attempts, d.now())
 	if err := d.cl.ProduceSync(ctx, out).FirstErr(); err != nil {
-		return fmt.Errorf("kafkax: dlq %s: %w", d.topic, err)
+		err = fmt.Errorf("kafkax: dlq %s: %w", d.topic, err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 	return nil
 }

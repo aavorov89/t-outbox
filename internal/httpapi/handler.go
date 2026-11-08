@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/aavorov89/t-outbox/internal/event"
 	"github.com/aavorov89/t-outbox/internal/money"
@@ -56,7 +57,15 @@ type api struct {
 	now   func() time.Time
 }
 
-// New returns the payments-api handler with middleware applied.
+// New returns the payments-api handler with middleware applied, outermost first:
+//
+//	otelhttp     server span named after the route ("POST /payments/{id}/capture"); it
+//	             continues a traceparent sent by the client, else starts a trace
+//	recoverer    a panic becomes a 500 problem (and an error status on the span)
+//	logRequests  one log line per request, with trace_id and http.route
+//
+// The span is in the request context, so the repository's transaction span and the
+// outbox row's trace context descend from it.
 func New(store Store, opts Options) http.Handler {
 	a := &api{store: store, log: opts.Logger, now: opts.Now}
 	if a.log == nil {
@@ -69,7 +78,7 @@ func New(store Store, opts Options) http.Handler {
 	mux.HandleFunc("POST /payments", a.createPayment)
 	mux.HandleFunc("GET /payments/{id}", a.getPayment)
 	mux.HandleFunc("POST /payments/{id}/capture", a.capturePayment)
-	return a.recoverer(a.logRequests(mux))
+	return otelhttp.NewHandler(a.recoverer(a.logRequests(mux)), "payments-api")
 }
 
 // CreatePaymentRequest is the body of POST /payments.

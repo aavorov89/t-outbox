@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/aavorov89/t-outbox/internal/money"
 	"github.com/aavorov89/t-outbox/internal/outbox"
@@ -54,8 +55,13 @@ func New(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
 // A concurrent Create with the same key blocks on the unique index until the first
 // transaction ends, then gets the duplicate error (or succeeds if the first rolled back).
 // So a caller that then reads the key always sees a committed payment.
-func (r *Repo) Create(ctx context.Context, p payment.Payment, msg outbox.Message) error {
-	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+//
+// The transaction runs in a span "payment.create"; the outbox row stores that span's
+// trace context, so the relay's send span becomes its child.
+func (r *Repo) Create(ctx context.Context, p payment.Payment, msg outbox.Message) (err error) {
+	ctx, span := startSpan(ctx, "payment.create", p.ID)
+	defer func() { endSpan(span, err) }()
+	err = pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
 		b := &pgx.Batch{}
 		b.Queue(insertPaymentSQL,
 			p.ID, p.IdempotencyKey, p.MerchantID, p.Amount.Amount, p.Amount.Currency.Code(),
@@ -82,9 +88,14 @@ func (r *Repo) Create(ctx context.Context, p payment.Payment, msg outbox.Message
 // The row lock is what the outbox writer invariant needs: two concurrent updates of one
 // payment are serialized, so their events get outbox ids in commit order. fn sees the
 // latest committed state and may be called with a payment another request just changed.
-func (r *Repo) Update(ctx context.Context, id uuid.UUID, fn payment.UpdateFunc) (payment.Payment, error) {
+//
+// Like Create, the transaction runs in a span ("payment.update") whose trace context the
+// outbox row stores.
+func (r *Repo) Update(ctx context.Context, id uuid.UUID, fn payment.UpdateFunc) (_ payment.Payment, err error) {
+	ctx, span := startSpan(ctx, "payment.update", id)
+	defer func() { endSpan(span, err) }()
 	var out payment.Payment
-	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+	err = pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
 		cur, err := scanPayment(tx.QueryRow(ctx, selectPaymentSQL+` WHERE id = $1 FOR UPDATE`, id))
 		if err != nil {
 			return err
@@ -95,6 +106,7 @@ func (r *Repo) Update(ctx context.Context, id uuid.UUID, fn payment.UpdateFunc) 
 		}
 		if msg == nil {
 			out = cur
+			span.SetAttributes(attribute.Bool("payment.unchanged", true))
 			return nil // nothing to write; COMMIT just releases the lock
 		}
 		if err := checkUpdate(cur, next, *msg); err != nil {

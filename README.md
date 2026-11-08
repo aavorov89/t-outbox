@@ -10,8 +10,10 @@ At-least-once delivery from the outbox plus an idempotent consumer gives
 > M2 (walking skeleton: API → outbox → relay → Kafka → consumer), M3 (capture with
 > idempotency keys; relay with `SKIP LOCKED`, per-aggregate ordering, backoff and graceful
 > shutdown), M4 (idempotent ledger consumer: double-entry postings, `processed_events`,
-> retries, DLQ, offsets committed after the DB commit) and M5 (crash scenario: F5 kills a
-> relay's backend between Kafka's ack and the mark; `make chaos` SIGKILLs relays under load).
+> retries, DLQ, offsets committed after the DB commit), M5 (crash scenario: F5 kills a
+> relay's backend between Kafka's ack and the mark; `make chaos` SIGKILLs relays under load)
+> and M6 (OpenTelemetry tracing across all three services, one trace per request through
+> the outbox and Kafka, exported to Jaeger).
 > See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, the failure-mode matrix
 > and the milestone plan.
 
@@ -20,7 +22,7 @@ At-least-once delivery from the outbox plus an idempotent consumer gives
 Requires Go 1.27+ and Docker.
 
 ```sh
-make up                 # postgres + redpanda + topics, then migrations
+make up                 # postgres + redpanda + topics + jaeger, then migrations
 make test               # unit tests, no Docker
 make test-integration   # testcontainers: starts its own Postgres and Redpanda
 make lint               # golangci-lint in Docker
@@ -73,3 +75,18 @@ prints how many events the kills made the relays publish twice; the consumer ski
 Amounts are `int64` minor units (`1999` = €19.99). JavaScript clients lose precision above
 2^53, which is why some APIs send amounts as strings. Errors are RFC 9457 problem details;
 see [docs/api-errors.md](docs/api-errors.md).
+
+## Tracing
+
+Every request is one trace across the API, the relay and the consumer: the trace context
+(W3C `traceparent` + `baggage`) is stored in the outbox row, copied into the Kafka headers
+by the relay's producer span and picked up by the consumer. The binaries export OTLP
+straight to Jaeger (`make up` starts it; `make run-*` and `make app` point at it). Open
+http://localhost:16686, pick `ledger-consumer` or `payments-api`:
+
+![One capture in Jaeger: API → relay → consumer](docs/img/jaeger-trace.png)
+
+Log lines carry `trace_id`/`span_id`, so `docker compose logs` leads to the trace and back.
+A client that sends its own `traceparent` gets the whole chain in its trace. The test that
+pins all of this is F10, `TestTracing_EndToEnd`; details in
+[ARCHITECTURE §9](docs/ARCHITECTURE.md#9-distributed-tracing-opentelemetry).

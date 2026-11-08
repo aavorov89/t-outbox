@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/aavorov89/t-outbox/internal/backoff"
 	"github.com/aavorov89/t-outbox/internal/event"
@@ -119,7 +120,7 @@ func (p *Processor) Process(ctx context.Context, rec *kgo.Record) (Result, error
 		"topic", rec.Topic, "partition", rec.Partition, "offset", rec.Offset)
 
 	for attempt := 1; ; attempt++ {
-		dup, err := p.attempt(ctx, env)
+		dup, err := p.attempt(ctx, env, attempt)
 		res := Result{Duplicate: dup, Attempts: attempt}
 		switch {
 		case err == nil:
@@ -142,9 +143,18 @@ func (p *Processor) Process(ctx context.Context, rec *kgo.Record) (Result, error
 	}
 }
 
-// attempt runs one transaction: the dedup marker and the Handler's side effect. A panic in
-// the Handler rolls back and is returned as a (transient) error.
-func (p *Processor) attempt(ctx context.Context, env event.Envelope) (dup bool, err error) {
+// attempt runs attempt number n: one transaction with the dedup marker and the Handler's
+// side effect, in a span of its own. A panic in the Handler rolls back and is returned as
+// a (transient) error.
+func (p *Processor) attempt(ctx context.Context, env event.Envelope, n int) (dup bool, err error) {
+	ctx, span := startAttemptSpan(ctx, p.cfg.Consumer, n)
+	defer func() {
+		span.SetAttributes(attribute.Bool("consumer.duplicate", dup))
+		if err != nil {
+			failSpan(span, err)
+		}
+		span.End()
+	}()
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.AttemptTimeout)
 	defer cancel()
 	err = pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) (err error) {

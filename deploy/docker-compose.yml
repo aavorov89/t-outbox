@@ -1,9 +1,10 @@
 # Local dev stack. Image versions live in deploy/.env (shared with testcontainers).
 # Integration tests do NOT use this file; they start their own containers.
 #
-# Default services: postgres, redpanda, topics (`make up`). The `app` profile adds the
-# binaries, built from deploy/Dockerfile: api, two relays and the ledger consumer
-# (`make app`, used by `make chaos`).
+# Default services: postgres, redpanda, topics, jaeger (`make up`). The `app` profile adds
+# the binaries, built from deploy/Dockerfile: api, two relays and the ledger consumer
+# (`make app`, used by `make chaos`). They send traces over OTLP/HTTP straight to Jaeger:
+# UI on http://localhost:16686.
 name: t-outbox
 
 x-app: &app
@@ -20,6 +21,7 @@ x-app: &app
   environment: &app-env
     DATABASE_URL: postgres://outbox:outbox@postgres:5432/outbox?sslmode=disable
     KAFKA_BROKERS: redpanda:9092
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
 
 x-after-setup: &after-setup
   migrate:
@@ -92,19 +94,36 @@ services:
       - "${API_PORT:-8080}:8080"
     depends_on: *after-setup
 
-  relay-1: &relay
+  # service.instance.id tells the two relays apart in Jaeger.
+  relay-1:
     <<: *app
     command: ["outbox-relay"]
+    environment:
+      <<: *app-env
+      OTEL_RESOURCE_ATTRIBUTES: service.instance.id=relay-1
     depends_on: *after-setup
 
-  relay-2: *relay
+  relay-2:
+    <<: *app
+    command: ["outbox-relay"]
+    environment:
+      <<: *app-env
+      OTEL_RESOURCE_ATTRIBUTES: service.instance.id=relay-2
+    depends_on: *after-setup
 
   ledger-consumer:
     <<: *app
     command: ["ledger-consumer"]
     depends_on: *after-setup
 
-  # Jaeger is added in M6.
+  # All-in-one Jaeger v2 with in-memory storage. It accepts OTLP natively, so the services
+  # export straight to it, no collector in between. The app does not wait for it: spans
+  # are exported in the background and dropped (with a warning) while it is down.
+  jaeger:
+    image: ${JAEGER_IMAGE}
+    ports:
+      - "${JAEGER_UI_PORT:-16686}:16686"   # UI
+      - "${OTLP_HTTP_PORT:-4318}:4318"     # OTLP/HTTP, for `make run-*`
 
 volumes:
   pgdata:
