@@ -215,7 +215,7 @@ func call(ctx context.Context, c *http.Client, url, body string, out any) (time.
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	b, err := io.ReadAll(resp.Body)
 	d := time.Since(start)
 	if err != nil {

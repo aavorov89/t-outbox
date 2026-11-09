@@ -147,8 +147,28 @@ come from the database's own timestamps.
 
 | Scenario | Result |
 |---|---|
-| API capacity: 16 clients, 30s, create + capture | **1,267 payments/s** (2,533 requests/s); p50 5.7ms, p99 10.7ms (create) / 11.3ms (capture) |
-| One relay claim of 100 with 20,000 pending rows, planner stats of an empty queue | **1.1ms** now; 435ms with the original guard (F11) |
+| **API capacity**: 16 clients, 30s, create + capture as fast as it answers | **1,267 payments/s** (2,533 requests/s, 2,533 events/s); p50 5.7ms, p99 10.7ms (create) / 11.3ms (capture) |
+| … the relays meanwhile (2 relays) | kept up: 2,537 events/s, write → published p50 118ms, p99 261ms |
+| **Steady state**: 100 payments/s (200 events/s), 30s | write → applied in the ledger: **p50 258ms, p99 481ms** (write → published p50 196ms, published → applied p50 60ms) |
+| **Backlog drain**, 20,000 events: 1 relay | **9,387 events/s** |
+| … 2 relays | **14,754 events/s** |
+| **Consumer** (one tx per event, sequential per member): 1 member | **315–333 events/s** |
+| … 3 members (6 partitions) | **972 events/s** |
+| One relay claim of 100 with 20,000 pending rows, planner stats of an empty queue | **1.1ms**; 435ms with the original guard (F11) |
+
+Reading them:
+
+- **The relays are not the bottleneck.** One relay drains a backlog at about 9,400 events/s
+  (full batches skip the poll sleep), several times what the API can write.
+- **Idle latency is the poll interval.** At a low rate most of the end-to-end lag is
+  write → published, about one `RELAY_POLL_INTERVAL` (200ms). `LISTEN/NOTIFY` would cut
+  it; a shorter interval would too, at the price of more idle claims.
+- **The consumer is the slowest stage**: a transaction per event (`processed_events` +
+  ledger rows), with the partitions of a poll handled one after another. It scales
+  linearly with members up to the partition count (≈ 3× with 3 members). At the API's
+  full rate, one member falls behind (the e2e lag in the capacity run grew to 198s while
+  it drained 76,000 events). Batching several events per transaction is the next step if
+  that matters.
 
 The first run of `make load` found a real bug. With the original `NOT EXISTS` ordering
 guard, a backlog that appeared while the planner's statistics described an empty queue
@@ -157,10 +177,6 @@ ran for over 6 minutes holding locks on 39 rows that no other relay could take. 
 is now a unique-key probe of the previous version, relay sessions have a 5s
 `statement_timeout`, and F11 pins the plan. Full story:
 [ADR 0004, M7 amendment](docs/adr/0004-per-aggregate-ordering-guard.md#amendment-m7-the-form-of-the-guard-matters-to-the-planner).
-
-The single ledger consumer applies events one transaction at a time (about 400 events/s
-per member in the first run), well below the API's write rate. It scales by consumer
-members, up to the 6 partitions.
 
 ## Design
 

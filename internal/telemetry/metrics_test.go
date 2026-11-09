@@ -42,23 +42,24 @@ func TestNewMetrics_PrometheusNames(t *testing.T) {
 
 // ServeMetrics fails at start-up when the port is taken, and serves GET /metrics.
 func TestServeMetrics(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ctx := context.Background()
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	addr := ln.Addr().String()
-	_, err = telemetry.ServeMetrics(addr, http.NotFoundHandler(), slog.Default())
+	_, err = telemetry.ServeMetrics(ctx, addr, http.NotFoundHandler(), slog.Default())
 	require.Error(t, err, "port taken")
 	require.NoError(t, ln.Close())
 
-	stop, err := telemetry.ServeMetrics(addr, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	stop, err := telemetry.ServeMetrics(ctx, addr, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "ok")
 	}), slog.Default())
 	require.NoError(t, err)
 	defer stop()
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+addr+"/metrics", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/metrics", nil)
 	require.NoError(t, err)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	b, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.Equal(t, "ok", string(b))

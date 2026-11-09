@@ -70,11 +70,11 @@ func newRegistry() *prometheus.Registry {
 	return reg
 }
 
-// ServeMetrics serves h on addr at /metrics until stop is called. It listens before it
+// ServeMetrics serves h on addr at /metrics until stop is called (ctx bounds only the listen). It listens before it
 // returns, so a port that is taken fails start-up instead of leaving a process nobody
 // can scrape. Serving errors after that are logged.
-func ServeMetrics(addr string, h http.Handler, log *slog.Logger) (stop func(), err error) {
-	ln, err := net.Listen("tcp", addr)
+func ServeMetrics(ctx context.Context, addr string, h http.Handler, log *slog.Logger) (stop func(), err error) {
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("telemetry: metrics listener: %w", err)
 	}

@@ -90,7 +90,7 @@ func run() error {
 	}
 	defer func() { _ = unobserve() }()
 	metricsAddr := getenv("METRICS_ADDR", ":9464")
-	stopMetrics, err := telemetry.ServeMetrics(metricsAddr, metrics, log)
+	stopMetrics, err := telemetry.ServeMetrics(ctx, metricsAddr, metrics, log)
 	if err != nil {
 		return err
 	}
